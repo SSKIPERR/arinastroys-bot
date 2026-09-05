@@ -1,8 +1,9 @@
-"""Голос бренда и генерация текстов. Обращаемся к Anthropic напрямую по HTTP."""
+"""Голос бренда и генерация текстов. Работает на Gemini (бесплатный тариф) или Anthropic."""
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from typing import Any
 
@@ -73,7 +74,53 @@ class LLMError(RuntimeError):
     pass
 
 
+# Провайдер выбирается сам: есть ключ Gemini — работаем на нём (бесплатный тариф),
+# иначе на Anthropic. Принудительно — переменная LLM_PROVIDER=gemini|anthropic.
+PROVIDER = (os.getenv("LLM_PROVIDER") or "").strip().lower()
+GEMINI_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
+GEMINI_MODEL = (os.getenv("GEMINI_MODEL") or "gemini-3.8-flash").strip()
+
+
+def provider() -> str:
+    if PROVIDER in {"gemini", "anthropic"}:
+        return PROVIDER
+    return "gemini" if GEMINI_KEY else "anthropic"
+
+
 def ask(user: str, max_tokens: int = 1600) -> str:
+    return _ask_gemini(user, max_tokens) if provider() == "gemini" \
+        else _ask_anthropic(user, max_tokens)
+
+
+def _ask_gemini(user: str, max_tokens: int) -> str:
+    if not GEMINI_KEY:
+        raise LLMError("не задан GEMINI_API_KEY")
+    r = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+        headers={"x-goog-api-key": GEMINI_KEY, "content-type": "application/json"},
+        json={
+            "system_instruction": {"parts": [{"text": BRAND}]},
+            "contents": [{"role": "user", "parts": [{"text": user}]}],
+            "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.85},
+        },
+        timeout=180,
+    )
+    if r.status_code != 200:
+        raise LLMError(f"Gemini {r.status_code}: {r.text[:300]}")
+
+    data = r.json()
+    cands = data.get("candidates") or []
+    if not cands:
+        raise LLMError(f"Gemini вернул пусто: {str(data)[:200]}")
+    parts = (cands[0].get("content") or {}).get("parts") or []
+    text = "".join(p.get("text", "") for p in parts).strip()
+    if not text:
+        # чаще всего это фильтр безопасности или обрезка по лимиту токенов
+        raise LLMError(f"Gemini не дал текста, finishReason={cands[0].get('finishReason')}")
+    return text
+
+
+def _ask_anthropic(user: str, max_tokens: int) -> str:
     if not settings.anthropic_key:
         raise LLMError("не задан ANTHROPIC_API_KEY")
     r = requests.post(
