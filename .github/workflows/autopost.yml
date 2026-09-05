@@ -1,0 +1,52 @@
+name: Придумать пост на завтра
+
+on:
+  schedule:
+    # 19:00 МСК накануне дней публикации (вс, вт, чт) — 16:00 UTC
+    - cron: "0 16 * * 0,2,4"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: arinastroys-tick
+  cancel-in-progress: false
+
+jobs:
+  autopost:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Придумать и прислать на утверждение
+        working-directory: scripts
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          BRAND_CHANNEL: ${{ vars.BRAND_CHANNEL }}
+          CONTACT_USERNAME: ${{ vars.CONTACT_USERNAME }}
+          POST_DAYS: ${{ vars.POST_DAYS }}
+          POST_TIME: ${{ vars.POST_TIME }}
+          AUTO_PUBLISH: ${{ vars.AUTO_PUBLISH }}
+        run: python autopost.py
+
+      - name: Сохранить состояние
+        if: always()
+        run: |
+          git config user.name "arinastroys-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add state/session.json
+          git diff --quiet --cached || git commit -m "state: автопост"
+          git pull --rebase --quiet || true
+          git push || true
