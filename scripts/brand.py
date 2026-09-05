@@ -288,3 +288,75 @@ def rewrite(text: str, instruction: str) -> str:
 
 Верни только новый текст поста: без пояснений, без хэштегов, без кавычек вокруг."""
     return ask(user, 1400)
+
+
+def _gemini_chain() -> list[str]:
+    """Модель из настроек, а за ней запасные — на случай перегрузки.
+
+    На бесплатном тарифе самая свежая модель регулярно отвечает 503:
+    к ней стоит очередь. Модель постарше в этот момент почти всегда свободна,
+    а качество текста для наших задач отличается несильно.
+    """
+    chain = [GEMINI_MODEL, "gemini-3.5-flash", "gemini-2.5-flash"]
+    seen, out = set(), []
+    for m in chain:
+        if m and m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
+
+
+def _gemini_once(model: str, user: str, max_tokens: int) -> tuple[str | None, str]:
+    """Один заход. Возвращает (текст или None, описание проблемы)."""
+    try:
+        r = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            headers={"x-goog-api-key": GEMINI_KEY, "content-type": "application/json"},
+            json={
+                "system_instruction": {"parts": [{"text": BRAND}]},
+                "contents": [{"role": "user", "parts": [{"text": user}]}],
+                "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.85},
+            },
+            timeout=180,
+        )
+    except requests.RequestException as e:
+        return None, f"{model}: сеть — {e}"
+
+    if r.status_code != 200:
+        return None, f"{model}: HTTP {r.status_code} {r.text[:200]}"
+
+    cands = (r.json().get("candidates") or [])
+    if not cands:
+        return None, f"{model}: пустой ответ"
+    parts = (cands[0].get("content") or {}).get("parts") or []
+    text = "".join(p.get("text", "") for p in parts).strip()
+    if not text:
+        return None, f"{model}: без текста, finishReason={cands[0].get('finishReason')}"
+    return text, ""
+
+
+RETRY_CODES = ("HTTP 429", "HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504", "сеть")
+
+
+def _ask_gemini(user: str, max_tokens: int) -> str:
+    if not GEMINI_KEY:
+        raise LLMError("не задан GEMINI_API_KEY")
+
+    problems: list[str] = []
+    for model in _gemini_chain():
+        for attempt in range(3):
+            text, why = _gemini_once(model, user, max_tokens)
+            if text:
+                if problems:
+                    log.info("получилось на %s после %d осечек", model, len(problems))
+                return text
+            problems.append(why)
+            log.warning("Gemini: %s", why)
+            if not any(code in why for code in RETRY_CODES):
+                break
+            time.sleep(2 * (attempt + 1))
+
+    raise LLMError("Gemini не ответил ни одной моделью: " + "; ".join(problems[-3:]))
+
+# нужен новому _ask_gemini для пауз между попытками
+import time  # noqa: E402
