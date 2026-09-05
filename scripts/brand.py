@@ -1,4 +1,4 @@
-"""Голос бренда и генерация текстов. Работает на Gemini (бесплатный тариф) или Anthropic."""
+"""Голос бренда и генерация текстов. Gemini (бесплатный тариф) или Anthropic."""
 from __future__ import annotations
 
 import json
@@ -88,8 +88,8 @@ def provider() -> str:
     return "gemini" if GEMINI_KEY else "anthropic"
 
 
-def ask(user: str, max_tokens: int = 1600) -> str:
-    return _ask_gemini(user, max_tokens) if provider() == "gemini" \
+def ask(user: str, max_tokens: int = 1600, want_json: bool = False) -> str:
+    return _ask_gemini(user, max_tokens, want_json) if provider() == "gemini" \
         else _ask_anthropic(user, max_tokens)
 
 
@@ -109,8 +109,15 @@ def _gemini_chain() -> list[str]:
     return out
 
 
-def _gemini_once(model: str, user: str, max_tokens: int) -> tuple[str | None, str]:
+def _gemini_once(model: str, user: str, max_tokens: int,
+                 want_json: bool = False) -> tuple[str | None, str]:
     """Один заход. Возвращает (текст или None, описание проблемы)."""
+    cfg: dict = {"maxOutputTokens": max_tokens, "temperature": 0.85}
+    if want_json:
+        # без этого модель обрамляет JSON пояснениями, и разбор падает
+        cfg["responseMimeType"] = "application/json"
+    # модели Gemini 3 тратят часть бюджета на размышления, и ответ обрывается
+    cfg["thinkingConfig"] = {"thinkingBudget": 0}
     try:
         r = requests.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
@@ -118,7 +125,7 @@ def _gemini_once(model: str, user: str, max_tokens: int) -> tuple[str | None, st
             json={
                 "system_instruction": {"parts": [{"text": BRAND}]},
                 "contents": [{"role": "user", "parts": [{"text": user}]}],
-                "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.85},
+                "generationConfig": cfg,
             },
             timeout=180,
         )
@@ -143,14 +150,14 @@ def _gemini_once(model: str, user: str, max_tokens: int) -> tuple[str | None, st
 RETRY_CODES = ("HTTP 429", "HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504", "сеть")
 
 
-def _ask_gemini(user: str, max_tokens: int) -> str:
+def _ask_gemini(user: str, max_tokens: int, want_json: bool = False) -> str:
     if not GEMINI_KEY:
         raise LLMError("не задан GEMINI_API_KEY")
 
     problems: list[str] = []
     for model in _gemini_chain():
         for attempt in range(3):
-            text, why = _gemini_once(model, user, max_tokens)
+            text, why = _gemini_once(model, user, max_tokens, want_json)
             if text:
                 if problems:
                     log.info("получилось на %s после %d осечек", model, len(problems))
@@ -199,7 +206,13 @@ def _json(text: str) -> Any:
     end = max(text.rfind("}"), text.rfind("]"))
     if end >= 0:
         text = text[: end + 1]
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        # чаще всего ответ обрезан по лимиту токенов — покажем начало и конец
+        raise LLMError(
+            f"не разобрал ответ модели ({e}). Начало: {text[:200]!r} … конец: {text[-120:]!r}"
+        ) from e
 
 
 # ---------------------------------------------------------------- задачи
@@ -228,7 +241,7 @@ def caption_for_object(*, guess: str, note: str, photos: int, videos: int,
   "hashtags": ["#..."],
   "video_title": "2-4 слова для титра на видео",
   "video_subtitle": "город или тип объекта, до 30 знаков, можно пустую строку"}}"""
-    data = _json(ask(user, 1200))
+    data = _json(ask(user, 1200, want_json=True))
     data["hashtags"] = data.get("hashtags", [])[:8]
     return data
 
@@ -249,7 +262,7 @@ def generate_post(rubric: str, topic: str, brief: str = "", avoid: list[str] | N
   "hashtags": ["#..."],
   "card_title": "заголовок для картинки, 2-5 слов",
   "card_lines": ["до 5 коротких пунктов для картинки, по 3-6 слов"]}}"""
-    data = _json(ask(user, 1600))
+    data = _json(ask(user, 1600, want_json=True))
     data["hashtags"] = data.get("hashtags", [])[:8]
     data["card_lines"] = data.get("card_lines", [])[:5]
     return data
@@ -274,7 +287,7 @@ def generate_ideas(n: int = 12, avoid: list[str] | None = None) -> list[dict]:
 
 Верни строго JSON-массив:
 [{{"rubric": "expertise", "topic": "...", "brief": "1-2 предложения"}}]"""
-    return [d for d in _json(ask(user, 2600)) if d.get("topic")][:n]
+    return [d for d in _json(ask(user, 4000, want_json=True)) if d.get("topic")][:n]
 
 
 def rewrite(text: str, instruction: str) -> str:
@@ -288,75 +301,3 @@ def rewrite(text: str, instruction: str) -> str:
 
 Верни только новый текст поста: без пояснений, без хэштегов, без кавычек вокруг."""
     return ask(user, 1400)
-
-
-def _gemini_chain() -> list[str]:
-    """Модель из настроек, а за ней запасные — на случай перегрузки.
-
-    На бесплатном тарифе самая свежая модель регулярно отвечает 503:
-    к ней стоит очередь. Модель постарше в этот момент почти всегда свободна,
-    а качество текста для наших задач отличается несильно.
-    """
-    chain = [GEMINI_MODEL, "gemini-3.5-flash", "gemini-2.5-flash"]
-    seen, out = set(), []
-    for m in chain:
-        if m and m not in seen:
-            seen.add(m)
-            out.append(m)
-    return out
-
-
-def _gemini_once(model: str, user: str, max_tokens: int) -> tuple[str | None, str]:
-    """Один заход. Возвращает (текст или None, описание проблемы)."""
-    try:
-        r = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-            headers={"x-goog-api-key": GEMINI_KEY, "content-type": "application/json"},
-            json={
-                "system_instruction": {"parts": [{"text": BRAND}]},
-                "contents": [{"role": "user", "parts": [{"text": user}]}],
-                "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.85},
-            },
-            timeout=180,
-        )
-    except requests.RequestException as e:
-        return None, f"{model}: сеть — {e}"
-
-    if r.status_code != 200:
-        return None, f"{model}: HTTP {r.status_code} {r.text[:200]}"
-
-    cands = (r.json().get("candidates") or [])
-    if not cands:
-        return None, f"{model}: пустой ответ"
-    parts = (cands[0].get("content") or {}).get("parts") or []
-    text = "".join(p.get("text", "") for p in parts).strip()
-    if not text:
-        return None, f"{model}: без текста, finishReason={cands[0].get('finishReason')}"
-    return text, ""
-
-
-RETRY_CODES = ("HTTP 429", "HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504", "сеть")
-
-
-def _ask_gemini(user: str, max_tokens: int) -> str:
-    if not GEMINI_KEY:
-        raise LLMError("не задан GEMINI_API_KEY")
-
-    problems: list[str] = []
-    for model in _gemini_chain():
-        for attempt in range(3):
-            text, why = _gemini_once(model, user, max_tokens)
-            if text:
-                if problems:
-                    log.info("получилось на %s после %d осечек", model, len(problems))
-                return text
-            problems.append(why)
-            log.warning("Gemini: %s", why)
-            if not any(code in why for code in RETRY_CODES):
-                break
-            time.sleep(2 * (attempt + 1))
-
-    raise LLMError("Gemini не ответил ни одной моделью: " + "; ".join(problems[-3:]))
-
-# нужен новому _ask_gemini для пауз между попытками
-import time  # noqa: E402
