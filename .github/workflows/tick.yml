@@ -54,9 +54,18 @@ jobs:
       - name: Сохранить состояние
         if: always()
         run: |
+          echo '--- что изменилось ---'
+          git status --porcelain state/ || true
+          echo '--- содержимое ---'
+          head -c 600 state/session.json; echo
           git config user.name "arinastroys-bot"
           git config user.email "bot@users.noreply.github.com"
           git add state/session.json
-          git diff --quiet --cached || git commit -m "state: обновление"
-          git pull --rebase --quiet || true
-          git push || true
+          if git diff --quiet --cached; then
+            echo 'состояние не менялось, коммит не нужен'
+          else
+            git commit -m "state: обновление"
+            git pull --rebase
+            git push
+            echo 'состояние сохранено'
+          fi
