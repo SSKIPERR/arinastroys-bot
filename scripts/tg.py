@@ -75,6 +75,11 @@ def get_updates(offset: int, poll: int = 25) -> list[dict]:
     ) or []
 
 
+def confirm(offset: int) -> None:
+    """Подтверждает обработанные события — Telegram убирает их из очереди."""
+    call("getUpdates", http_timeout=30, offset=offset, limit=1, timeout=0)
+
+
 def peek_updates() -> list[dict]:
     """Смотрит очередь, ничего не подтверждая: offset=-1 отдаёт последнее событие."""
     return call("getUpdates", http_timeout=30, offset=-1, limit=1) or []
