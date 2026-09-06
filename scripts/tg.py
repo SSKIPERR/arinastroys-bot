@@ -23,7 +23,15 @@ class TgError(RuntimeError):
     pass
 
 
-def call(method: str, timeout: int = 60, files: dict | None = None, **params: Any) -> Any:
+def call(method: str, http_timeout: int = 60, files: dict | None = None, **params: Any) -> Any:
+    """Вызов метода Bot API.
+
+    ВНИМАНИЕ: http_timeout — это таймаут HTTP-запроса, он НЕ уходит в Telegram.
+    Все остальные именованные аргументы уходят в Telegram как есть, включая
+    timeout= (длинный опрос getUpdates). Раньше параметр назывался timeout и
+    перехватывал одноимённый параметр Telegram — длинный опрос молча не работал.
+    """
+    timeout = http_timeout
     payload = {k: v for k, v in params.items() if v is not None}
     for k, v in list(payload.items()):
         if isinstance(v, (dict, list)):
@@ -59,11 +67,25 @@ def call(method: str, timeout: int = 60, files: dict | None = None, **params: An
 
 # ---------------------------------------------------------------- приём
 
-def get_updates(offset: int, timeout: int = 25) -> list[dict]:
+def get_updates(offset: int, poll: int = 25) -> list[dict]:
     return call(
-        "getUpdates", offset=offset, timeout=timeout, limit=100,
-        allowed_updates=["message", "callback_query"],
+        "getUpdates", http_timeout=poll + 20,
+        offset=offset, timeout=poll, limit=100,
+        allowed_updates=["message", "callback_query", "channel_post", "my_chat_member"],
     ) or []
+
+
+def peek_updates() -> list[dict]:
+    """Смотрит очередь, ничего не подтверждая: offset=-1 отдаёт последнее событие."""
+    return call("getUpdates", http_timeout=30, offset=-1, limit=1) or []
+
+
+def webhook_info() -> dict:
+    return call("getWebhookInfo", http_timeout=30) or {}
+
+
+def me() -> dict:
+    return call("getMe", http_timeout=30) or {}
 
 
 def download(file_id: str, dest: Path) -> Path:
@@ -102,7 +124,7 @@ def send_photo(chat: int | str, photo: Path | str, caption: str = "",
         with photo.open("rb") as f:
             return call("sendPhoto", chat_id=chat, caption=caption[:1024] or None,
                         parse_mode="HTML", reply_markup=markup,
-                        files={"photo": (photo.name, f)}, timeout=300)
+                        files={"photo": (photo.name, f)}, http_timeout=300)
     return call("sendPhoto", chat_id=chat, photo=photo, caption=caption[:1024] or None,
                 parse_mode="HTML", reply_markup=markup)
 
@@ -115,7 +137,7 @@ def send_video(chat: int | str, video: Path | str, caption: str = "",
             return call("sendVideo", chat_id=chat, caption=caption[:1024] or None,
                         parse_mode="HTML", supports_streaming=True,
                         width=1080, height=1920, reply_markup=markup,
-                        files={"video": (video.name, f)}, timeout=900)
+                        files={"video": (video.name, f)}, http_timeout=900)
     return call("sendVideo", chat_id=chat, video=video, caption=caption[:1024] or None,
                 parse_mode="HTML", supports_streaming=True, reply_markup=markup)
 
