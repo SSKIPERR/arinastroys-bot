@@ -53,9 +53,16 @@ def font(kind: str, size: int) -> ImageFont.FreeTypeFont:
     if not path:
         return ImageFont.load_default()
     try:
-        return ImageFont.truetype(path, size)
+        f = ImageFont.truetype(path, size)
     except OSError:
         return ImageFont.load_default()
+    # вариативные шрифты Google по умолчанию отдают Regular — просим нужный вес
+    want = {"display": "Bold", "text-bold": "Bold"}.get(kind, "Regular")
+    try:
+        f.set_variation_by_name(want)
+    except Exception:  # noqa: BLE001  обычный статический шрифт — и хорошо
+        pass
+    return f
 
 
 def wrap(draw: ImageDraw.ImageDraw, text: str, f: ImageFont.FreeTypeFont,
