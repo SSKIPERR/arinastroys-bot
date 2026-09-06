@@ -665,13 +665,22 @@ def main() -> int:
              st["offset"], len(st.get("posts", {})), len(st.get("ideas", [])))
 
     try:
-        updates = tg.get_updates(st["offset"], poll=20)
+        # Без offset: Telegram отдаёт всё неподтверждённое и НИЧЕГО не вычёркивает.
+        # Подтверждаем сами в конце — так offset физически не может убежать вперёд.
+        raw = tg.get_updates(0, poll=20)
     except Exception as e:  # noqa: BLE001
         log.error("почту забрать не вышло: %s", e)
         return 1
-    log.info("новых событий: %d", len(updates))
 
-    if not updates:
+    updates = [u for u in raw if u["update_id"] >= st["offset"]]
+    if raw and not updates:
+        log.warning("offset убежал вперёд: в состоянии %s, в очереди %s — откатываю",
+                    st["offset"], raw[0]["update_id"])
+        st["offset"] = raw[0]["update_id"]
+        updates = raw
+    log.info("в очереди: %d, из них новых: %d", len(raw), len(updates))
+
+    if not raw:
         # Почта пуста — выясняем, чья это пустота: Telegram молчит или мы не туда смотрим.
         try:
             who = tg.me()
@@ -719,6 +728,13 @@ def main() -> int:
                 tg.send_message(settings.owner_id, f"Спотыкнулся на одном сообщении: {e}")
             except Exception:  # noqa: BLE001
                 pass
+
+    if raw:
+        # только теперь просим Telegram вычеркнуть разобранное
+        try:
+            tg.confirm(raw[-1]["update_id"] + 1)
+        except Exception as e:  # noqa: BLE001
+            log.warning("очередь не подтвердилась: %s", e)
 
     # пачка считается законченной, если новых файлов давно не было
     batch = st.get("batch")
