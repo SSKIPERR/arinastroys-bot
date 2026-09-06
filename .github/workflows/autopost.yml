@@ -27,6 +27,15 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      - name: Фирменные шрифты
+        run: |
+          mkdir -p assets/fonts
+          B=https://raw.githubusercontent.com/google/fonts/main
+          get() { [ -s "assets/fonts/$2" ] || curl -fsSL "$1" -o "assets/fonts/$2" || echo "не скачался: $2"; }
+          get "$B/ofl/oswald/Oswald%5Bwght%5D.ttf" Oswald-Variable.ttf
+          get "$B/ofl/golostext/GolosText%5Bwght%5D.ttf" GolosText-Variable.ttf
+          get "$B/ofl/jetbrainsmono/JetBrainsMono%5Bwght%5D.ttf" JetBrainsMono-Variable.ttf
+
       - name: Придумать и прислать на утверждение
         working-directory: scripts
         env:
