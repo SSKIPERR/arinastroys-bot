@@ -267,14 +267,30 @@ def generate_post(rubric: str, topic: str, brief: str = "", avoid: list[str] | N
 как устроена работа вообще, а не как отчёт о выполненном проекте. Никаких
 «в этом проекте мы» и придуманных квартир — только общие формулировки.
 
+Подбери макет картинки под содержание:
+- "hero" — если в посте есть ударное число или короткое утверждение в 1-2 слова
+  («28 дней», «Ноль доплат», «5 этапов»). Тогда заполни card_hero.
+- "grid" — если пунктов ровно 4 или 6 и они равнозначны.
+- "band" — во всех остальных случаях. Это выбор по умолчанию.
+
 Верни строго JSON:
 {{"text": "готовый текст поста без хэштегов",
   "hashtags": ["#..."],
   "card_title": "заголовок для картинки, 2-5 слов",
-  "card_lines": ["до 5 коротких пунктов для картинки, по 3-6 слов"]}}"""
+  "card_lines": ["до 5 коротких пунктов для картинки, по 3-6 слов"],
+  "card_layout": "band | grid | hero",
+  "card_hero": "ударное число или слово, только для hero, иначе пустая строка"}}"""
     data = _json(ask(user, 1600, want_json=True))
     data["hashtags"] = data.get("hashtags", [])[:8]
     data["card_lines"] = data.get("card_lines", [])[:5]
+    layout = str(data.get("card_layout", "band")).strip().lower()
+    hero = str(data.get("card_hero", "") or "").strip()
+    # «герой» без ударного слова разваливается — страхуемся
+    if layout == "hero" and (not hero or len(hero) > 22):
+        layout = "band"
+    if layout not in {"band", "grid", "hero"}:
+        layout = "band"
+    data["card_layout"], data["card_hero"] = layout, hero
     return data
 
 
