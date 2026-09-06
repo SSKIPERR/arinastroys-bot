@@ -665,11 +665,46 @@ def main() -> int:
              st["offset"], len(st.get("posts", {})), len(st.get("ideas", [])))
 
     try:
-        updates = tg.get_updates(st["offset"], timeout=20)
+        updates = tg.get_updates(st["offset"], poll=20)
     except Exception as e:  # noqa: BLE001
         log.error("почту забрать не вышло: %s", e)
         return 1
     log.info("новых событий: %d", len(updates))
+
+    if not updates:
+        # Почта пуста — выясняем, чья это пустота: Telegram молчит или мы не туда смотрим.
+        try:
+            who = tg.me()
+            log.info("диагностика · бот: @%s (id=%s)", who.get("username"), who.get("id"))
+        except Exception as e:  # noqa: BLE001
+            log.error("диагностика · getMe не ответил: %s", e)
+        try:
+            wh = tg.webhook_info()
+            if wh.get("url"):
+                log.error("диагностика · ВЕБХУК ЗАНЯТ: %s — длинный опрос не получит НИЧЕГО",
+                          wh["url"])
+            else:
+                log.info("диагностика · вебхук не стоит, очередь ждёт: %s, последняя ошибка: %s",
+                         wh.get("pending_update_count"), wh.get("last_error_message") or "нет")
+        except Exception as e:  # noqa: BLE001
+            log.error("диагностика · getWebhookInfo не ответил: %s", e)
+        try:
+            tail = tg.peek_updates()
+            if not tail:
+                log.info("диагностика · очередь Telegram действительно пуста — "
+                         "события до бота не доходят")
+            else:
+                u = tail[-1]
+                kind = next((k for k in ("message", "callback_query", "channel_post",
+                                         "my_chat_member") if u.get(k)), "?")
+                log.info("диагностика · последнее событие: update_id=%s, тип=%s, наш offset=%s",
+                         u.get("update_id"), kind, st["offset"])
+                if u.get("update_id", 0) + 1 < st["offset"]:
+                    log.error("диагностика · offset УБЕЖАЛ ВПЕРЁД: просим %s, "
+                              "а Telegram отдаёт максимум %s — всё новое отбрасывается",
+                              st["offset"], u.get("update_id"))
+        except Exception as e:  # noqa: BLE001
+            log.error("диагностика · peek не ответил: %s", e)
 
     for u in updates:
         st["offset"] = u["update_id"] + 1
