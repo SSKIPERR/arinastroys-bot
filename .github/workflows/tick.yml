@@ -34,6 +34,16 @@ jobs:
           which ffmpeg || sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
           ffmpeg -version | head -1
 
+      - name: Фирменные шрифты
+        run: |
+          mkdir -p assets/fonts
+          B=https://raw.githubusercontent.com/google/fonts/main
+          get() { [ -s "assets/fonts/$2" ] || curl -fsSL "$1" -o "assets/fonts/$2" || echo "не скачался: $2"; }
+          get "$B/ofl/oswald/Oswald%5Bwght%5D.ttf" Oswald-Variable.ttf
+          get "$B/ofl/golostext/GolosText%5Bwght%5D.ttf" GolosText-Variable.ttf
+          get "$B/ofl/jetbrainsmono/JetBrainsMono%5Bwght%5D.ttf" JetBrainsMono-Variable.ttf
+          ls -la assets/fonts
+
       - name: Разобрать почту, смонтировать, опубликовать
         working-directory: scripts
         env:
