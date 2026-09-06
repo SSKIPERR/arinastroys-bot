@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import brand
+import cards
 import photo as ph
 import state as st_mod
 import tg
@@ -614,8 +615,14 @@ def make_auto_post(st: dict, force: bool = False) -> str | None:
     folder.mkdir(parents=True, exist_ok=True)
     card = None
     try:
-        card = ph.text_card(folder / "card.jpg", data.get("card_title") or idea["topic"],
-                            data.get("card_lines") or [])
+        card = cards.make(
+            folder / "card.jpg",
+            title=data.get("card_title") or idea["topic"],
+            lines=data.get("card_lines") or [],
+            label=brand.RUBRICS.get(idea.get("rubric", ""), "").split(" —")[0],
+            layout=data.get("card_layout", "band"),
+            hero=data.get("card_hero", ""),
+        )
     except Exception as e:  # noqa: BLE001
         log.warning("карточка не нарисовалась: %s", e)
 
