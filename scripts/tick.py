@@ -124,36 +124,51 @@ def queue_text(st: dict) -> str:
 
 
 def health_text(st: dict) -> str:
-    lines = []
+    """Ответ на «всё работает?» — по-человечески, а не приборной панелью."""
+    good, bad = [], []
     try:
         brand.ask("Ответь одним словом: работает", 20)
-        lines.append("Тексты пишу — модель отвечает.")
+        good.append("тексты пишу")
     except Exception as e:  # noqa: BLE001
-        lines.append(f"Тексты не пишу: {e}")
+        bad.append(f"текст сейчас не пишется ({e})")
     try:
         me = tg.call("getMe")
         member = tg.call("getChatMember", chat_id=settings.channel_id, user_id=me["id"])
-        can = member.get("can_post_messages")
-        lines.append("В канал писать могу." if can or member.get("status") == "creator"
-                     else f"В канал писать не могу: статус {member.get('status')}.")
+        if member.get("can_post_messages") or member.get("status") == "creator":
+            good.append("в канал публикую")
+        else:
+            bad.append(f"в канал писать не могу, статус {member.get('status')}")
     except Exception as e:  # noqa: BLE001
-        lines.append(f"С каналом проблема: {e}")
+        bad.append(f"с каналом заминка ({e})")
+
     music = [m for m in MUSIC_DIR.iterdir()
              if m.suffix.lower() in {".mp3", ".m4a", ".wav"}] if MUSIC_DIR.exists() else []
-    lines.append(f"Музыки {len(music)} трек(ов)." if music
-                 else "Музыки нет — ролики пока немые.")
-    lines.append(f"Видео принимаю до {tg.MAX_DOWNLOAD_MB} МБ.")
+    if music:
+        good.append(f"музыки {len(music)} трек(ов)")
+    else:
+        bad.append("музыки нет, ролики выходят немыми")
+
     waiting = sum(1 for p in st.get("posts", {}).values()
                   if p.get("status") in ("review", "scheduled"))
-    lines.append(f"В работе постов: {waiting}. Тем про запас: {len(st.get('ideas', []))}.")
-    return "\n".join(lines)
+    head = "Всё на месте: " + ", ".join(good) + "." if good else ""
+    tail = " Из недоделанного: " + "; ".join(bad) + "." if bad else ""
+    work = f" Сейчас в работе постов: {waiting}." if waiting else " В работе пока пусто."
+    return (head + tail + work).strip()
 
 
 # ---------------------------------------------------------------- разговор
 
 
+def remember(st: dict, who: str, text: str) -> None:
+    """Складываем переписку, иначе каждая фраза читается в отрыве от предыдущей."""
+    log_ = st.setdefault("chat_log", [])
+    log_.append({"who": who, "text": (text or "").strip()[:400]})
+    del log_[:-14]
+
+
 def converse(text: str, chat: int, st: dict) -> None:
     """Разбирает обычную фразу и делает то, о чём попросили."""
+    remember(st, "Давид", text)
     batch = st.get("batch") or {}
     posts = [
         {"id": pid, "status": ("ждёт решения" if p["status"] == "review" else "запланирован"),
@@ -162,7 +177,8 @@ def converse(text: str, chat: int, st: dict) -> None:
         if p.get("status") in ("review", "scheduled")
     ]
     ctx = {"media_count": len(batch.get("media") or []),
-           "note": batch.get("note") or "", "posts": posts}
+           "note": batch.get("note") or "", "posts": posts,
+           "history": st.get("chat_log") or []}
 
     try:
         r = brand.route_message(text, ctx)
@@ -179,15 +195,21 @@ def converse(text: str, chat: int, st: dict) -> None:
     log.info("понял как «%s»", act)
     if r["reply"]:
         tg.send_message(chat, r["reply"])
+        remember(st, "бот", r["reply"])
 
-    if act == "note":
-        st["batch"] = batch or {"media": [], "note": "", "last_ts": int(time.time())}
+    # Детали про объект нужны в тексте поста независимо от того, что он попросил:
+    # «собери пост, это кухня в Химках» — и приказ, и контекст одной фразой.
+    if act in ("note", "build") and (r["note"] or act == "note"):
+        st["batch"] = st.get("batch") or {"media": [], "note": "", "last_ts": int(time.time())}
         add = r["note"] or text
         st["batch"]["note"] = f"{st['batch'].get('note','')} {add}".strip()[:700]
+        batch = st["batch"]
 
-    elif act == "build":
+    if act == "build":
         if batch.get("media"):
-            st["batch"]["last_ts"] = 0        # закроем пачку в этом же заходе
+            # Он уже сказал «собирай» — переспрашивать второй раз незачем.
+            st["batch"]["last_ts"] = 0
+            st["batch"]["silent"] = True
         else:
             tg.send_message(chat, "Только материала пока нет — пришли фото или видео.")
 
@@ -229,7 +251,7 @@ def converse(text: str, chat: int, st: dict) -> None:
 # ---------------------------------------------------------------- разбор почты
 
 
-def handle_message(msg: dict, st: dict) -> None:
+def handle_message(msg: dict, st: dict, inbox: dict) -> None:
     user = msg.get("from") or {}
     chat = (msg.get("chat") or {}).get("id")
     if (msg.get("chat") or {}).get("type") != "private":
@@ -276,19 +298,15 @@ def handle_message(msg: dict, st: dict) -> None:
         batch = st.get("batch") or {"media": [], "note": "", "last_ts": 0}
         batch["media"].append({"kind": kind, "file_id": file_id})
         batch["last_ts"] = msg.get("date") or int(time.time())
-        if msg.get("caption"):
-            batch["note"] = f"{batch.get('note','')} {msg['caption']}".strip()[:700]
         st["batch"] = batch
         log.info("принял %s, в пачке %d", kind, len(batch["media"]))
+        inbox["chat"] = chat
         if first:
-            # отвечаем один раз за пачку, чтобы не засыпать его сообщениями
-            try:
-                tg.send_message(chat, brand.media_ack(
-                    batch.get("note", ""),
-                    1 if kind == "photo" else 0, 1 if kind == "video" else 0))
-            except Exception:  # noqa: BLE001
-                tg.send_message(chat, "Принял. Кидай остальное и расскажи пару слов "
-                                      "про объект — потом соберу.")
+            inbox["new_batch"] = True
+        # Подпись к фото — такое же указание, как отдельное сообщение.
+        # Разбираем её вместе со всеми текстами круга, когда пачка уже осела.
+        if msg.get("caption"):
+            inbox["texts"].append(msg["caption"].strip())
         return
 
     text = (msg.get("text") or "").strip()
@@ -316,8 +334,9 @@ def handle_message(msg: dict, st: dict) -> None:
         handle_command(text, chat, st)
         return
 
-    # ---- всё остальное разбирает модель, командовать не нужно ----
-    converse(text, chat, st)
+    # ---- всё остальное разбирает модель, но позже: сначала дособерём пачку ----
+    inbox["chat"] = chat
+    inbox["texts"].append(text)
 
 
 def handle_command(text: str, chat: int, st: dict) -> None:
@@ -485,7 +504,9 @@ def build_post(st: dict) -> None:
 
     note = (batch.get("note") or "").strip()
     owner = settings.owner_id
-    tg.send_message(owner, f"Взял в работу {len(media)} файл(ов). Монтирую…")
+    if not batch.get("silent"):
+        # когда сборку попросили словами, бот уже ответил — второй раз не повторяемся
+        tg.send_message(owner, f"Взял в работу {len(media)} файл(ов). Монтирую…")
 
     folder = WORK / f"batch{int(time.time())}"
     folder.mkdir(parents=True, exist_ok=True)
@@ -771,11 +792,15 @@ def one_round(st: dict, first: bool) -> None:
         except Exception as e:  # noqa: BLE001
             log.error("диагностика не прошла: %s", e)
 
+    # Разбираем сообщения не по одному: пока летят десять фото, «собери пост»
+    # приходит подписью к первому — и в отрыве от остальных читается неверно.
+    inbox: dict = {"texts": [], "chat": settings.owner_id, "new_batch": False}
+
     for u in updates:
         st["offset"] = u["update_id"] + 1
         try:
             if u.get("message"):
-                handle_message(u["message"], st)
+                handle_message(u["message"], st, inbox)
             elif u.get("callback_query"):
                 handle_callback(u["callback_query"], st)
         except Exception as e:  # noqa: BLE001
@@ -784,6 +809,25 @@ def one_round(st: dict, first: bool) -> None:
                 tg.send_message(settings.owner_id, f"Спотыкнулся на одном сообщении: {e}")
             except Exception:  # noqa: BLE001
                 pass
+
+    if inbox["texts"]:
+        n = len((st.get("batch") or {}).get("media") or [])
+        if inbox["new_batch"] and n:
+            remember(st, "система", f"Давид прислал файлов: {n}")
+        converse(" ".join(inbox["texts"]), inbox["chat"], st)
+    elif inbox["new_batch"]:
+        # файлы пришли молча — коротко подтверждаем и спрашиваем контекст
+        batch = st.get("batch") or {}
+        media = batch.get("media") or []
+        remember(st, "система", f"Давид прислал файлов: {len(media)}")
+        try:
+            ack = brand.media_ack(batch.get("note", ""),
+                                  sum(1 for m in media if m["kind"] == "photo"),
+                                  sum(1 for m in media if m["kind"] == "video"))
+        except Exception:  # noqa: BLE001
+            ack = "Принял. Расскажи пару слов про объект — и соберу пост."
+        tg.send_message(inbox["chat"], ack)
+        remember(st, "бот", ack)
 
     if raw:
         # только теперь просим Telegram вычеркнуть разобранное
