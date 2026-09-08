@@ -1,6 +1,7 @@
 """Голос бренда и генерация текстов. Gemini (бесплатный тариф) или Anthropic."""
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -94,9 +95,22 @@ def provider() -> str:
     return "gemini" if GEMINI_KEY else "anthropic"
 
 
-def ask(user: str, max_tokens: int = 1600, want_json: bool = False) -> str:
-    return _ask_gemini(user, max_tokens, want_json) if provider() == "gemini" \
-        else _ask_anthropic(user, max_tokens)
+def shrink(path, side: int = 768, quality: int = 78) -> str:
+    """Ужимает картинку и отдаёт base64: слать в модель оригиналы дорого и незачем."""
+    from io import BytesIO
+    from PIL import Image, ImageOps
+
+    im = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
+    im.thumbnail((side, side))
+    buf = BytesIO()
+    im.save(buf, "JPEG", quality=quality)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def ask(user: str, max_tokens: int = 1600, want_json: bool = False,
+        images: list | None = None) -> str:
+    return _ask_gemini(user, max_tokens, want_json, images) if provider() == "gemini" \
+        else _ask_anthropic(user, max_tokens, images)
 
 
 def _gemini_chain() -> list[str]:
@@ -116,7 +130,8 @@ def _gemini_chain() -> list[str]:
 
 
 def _gemini_once(model: str, user: str, max_tokens: int,
-                 want_json: bool = False) -> tuple[str | None, str]:
+                 want_json: bool = False,
+                 images: list | None = None) -> tuple[str | None, str]:
     """Один заход. Возвращает (текст или None, описание проблемы)."""
     cfg: dict = {"maxOutputTokens": max_tokens, "temperature": 0.85}
     if want_json:
@@ -130,7 +145,7 @@ def _gemini_once(model: str, user: str, max_tokens: int,
             headers={"x-goog-api-key": GEMINI_KEY, "content-type": "application/json"},
             json={
                 "system_instruction": {"parts": [{"text": BRAND}]},
-                "contents": [{"role": "user", "parts": [{"text": user}]}],
+                "contents": [{"role": "user", "parts": _parts(user, images)}],
                 "generationConfig": cfg,
             },
             timeout=180,
@@ -152,18 +167,31 @@ def _gemini_once(model: str, user: str, max_tokens: int,
     return text, ""
 
 
+def _parts(user: str, images: list | None) -> list[dict]:
+    """Картинки идут перед текстом: так модель сначала смотрит, потом читает задание."""
+    parts: list[dict] = []
+    for img in (images or [])[:8]:
+        try:
+            parts.append({"inline_data": {"mime_type": "image/jpeg", "data": shrink(img)}})
+        except Exception as e:  # noqa: BLE001
+            log.warning("картинку %s не приложил: %s", getattr(img, "name", img), e)
+    parts.append({"text": user})
+    return parts
+
+
 # коды, при которых имеет смысл подождать и повторить
 RETRY_CODES = ("HTTP 429", "HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504", "сеть")
 
 
-def _ask_gemini(user: str, max_tokens: int, want_json: bool = False) -> str:
+def _ask_gemini(user: str, max_tokens: int, want_json: bool = False,
+                images: list | None = None) -> str:
     if not GEMINI_KEY:
         raise LLMError("не задан GEMINI_API_KEY")
 
     problems: list[str] = []
     for model in _gemini_chain():
         for attempt in range(3):
-            text, why = _gemini_once(model, user, max_tokens, want_json)
+            text, why = _gemini_once(model, user, max_tokens, want_json, images)
             if text:
                 if problems:
                     log.info("получилось на %s после %d осечек", model, len(problems))
@@ -177,7 +205,7 @@ def _ask_gemini(user: str, max_tokens: int, want_json: bool = False) -> str:
     raise LLMError("Gemini не ответил ни одной моделью: " + "; ".join(problems[-3:]))
 
 
-def _ask_anthropic(user: str, max_tokens: int) -> str:
+def _ask_anthropic(user: str, max_tokens: int, images: list | None = None) -> str:
     if not settings.anthropic_key:
         raise LLMError("не задан ANTHROPIC_API_KEY")
     r = requests.post(
@@ -191,7 +219,13 @@ def _ask_anthropic(user: str, max_tokens: int) -> str:
             "model": settings.anthropic_model,
             "max_tokens": max_tokens,
             "system": BRAND,
-            "messages": [{"role": "user", "content": user}],
+            "messages": [{"role": "user", "content": [
+                *[{"type": "image", "source": {"type": "base64",
+                                               "media_type": "image/jpeg",
+                                               "data": shrink(i)}}
+                  for i in (images or [])[:8]],
+                {"type": "text", "text": user},
+            ]}],
         },
         timeout=180,
     )
@@ -225,30 +259,41 @@ def _json(text: str) -> Any:
 
 
 def caption_for_object(*, guess: str, note: str, photos: int, videos: int,
-                       has_before_after: bool) -> dict:
+                       has_before_after: bool, images: list | None = None) -> dict:
+    """Пишет пост по материалу. Картинки уходят в модель — она пишет о том, что видит."""
     user = f"""Собери пост для Telegram-канала по материалу с объекта.
 
-Что прислали:
-- Похоже на: {guess}
+{"Кадры приложены выше — смотри на них и пиши о том, что на них действительно есть."
+ if images else "Кадры приложить не удалось, пиши по комментарию."}
+
+Что известно:
 - Комментарий от Давида (может быть пустым): {note or "нет"}
 - Фото: {photos}, видео: {videos}{", есть пара до/после" if has_before_after else ""}
+- На что похоже по типу файлов: {guess}
 
 Правила для этого поста:
-- Опирайся на комментарий. Не выдумывай деталей, которых в нём нет:
-  ни города, ни метража, ни сроков, ни материалов.
-- Если комментария нет — пиши коротко и общо, про сам факт работы и подход
-  компании. Лучше четыре строки правды, чем десять строк выдумки.
-- Если в комментарии есть город и это не Москва — упомяни, что выезжали:
-  для региональной аудитории это важный сигнал.
+- Главный источник правды — сами кадры и комментарий Давида. Если комментарий
+  и кадры расходятся, верь комментарию: он знает объект, а ты видишь один ракурс.
+- Пиши про то, что реально видно: помещение, стадия, приёмы, материалы, свет,
+  узлы. Одна конкретная деталь с фотографии стоит десяти общих слов.
+- Категорически нельзя писать «показываем рабочие моменты», «делимся процессом»
+  и прочие заглушки ни о чём. Если сказать нечего — скажи мало, но по делу.
+- Не выдумывай то, чего не видно и о чём не сказано: метраж, сроки, бренды,
+  цены, имена. Не приписывай стадию, если она не видна: готовый интерьер
+  не называй промежуточным этапом и наоборот.
+- Если в комментарии есть город и это не Москва — упомяни, что выезжали.
 - Заголовок первой строкой, без markdown-решёток.
 
 Верни строго JSON:
 {{"text": "текст поста без хэштегов",
   "hashtags": ["#..."],
   "video_title": "2-4 слова для титра на видео",
-  "video_subtitle": "город или тип объекта, до 30 знаков, можно пустую строку"}}"""
-    data = _json(ask(user, 1200, want_json=True))
+  "video_subtitle": "город или тип объекта, до 30 знаков, можно пустую строку",
+  "seen": "одной строкой: что ты разглядел на кадрах"}}"""
+    data = _json(ask(user, 1300, want_json=True, images=images))
     data["hashtags"] = data.get("hashtags", [])[:8]
+    if data.get("seen"):
+        log.info("на кадрах: %s", str(data["seen"])[:200])
     return data
 
 
@@ -331,97 +376,100 @@ def rewrite(text: str, instruction: str) -> str:
 
 # ---------------------------------------------------------------- разговор
 
-ACTIONS = {"build", "note", "queue", "drop", "edit", "publish", "invent",
-           "status", "smalltalk"}
+
+TOOLS = {"make_post", "publish", "schedule", "rewrite", "remake_video",
+         "drop", "show_queue", "invent", "health"}
+
+TOOLBOX = """Инструменты (можешь вызвать несколько подряд, можешь ни одного):
+
+make_post — собрать пост из файлов, которые он прислал.
+    format: "photos" — пост фотографиями, без монтажа;
+            "reel" — вертикальный ролик с титрами;
+            "auto" — решай сам: есть видео или больше трёх фото → ролик, иначе фото.
+    note: детали объекта его словами (город, помещение, стадия, что делали).
+    keep_order: true, если он просил не менять порядок кадров.
+publish — опубликовать готовый пост в канал. post_id.
+schedule — поставить пост в расписание. post_id.
+rewrite — переписать текст готового поста. post_id, how (что именно поменять).
+remake_video — перемонтировать ролик у готового поста. post_id.
+drop — убрать пост. post_id.
+show_queue — показать, что в работе.
+invent — придумать пост самому, без его материала. topic (можно пустым).
+health — проверить, всё ли работает."""
 
 
-def route_message(text: str, ctx: dict) -> dict:
-    """Понимает обычную фразу Давида в контексте всей переписки.
+def decide(text: str, ctx: dict) -> dict:
+    """Решает, что делать с сообщением Давида, и что ему ответить.
 
-    Без истории каждая фраза читалась в отрыве от предыдущей, и бот переспрашивал
-    то, о чём уже договорились. Поэтому сюда уходит последние ходы диалога.
+    Не классификатор на девять кнопок, а список действий с параметрами: одна
+    фраза может значить «собери пост фотками, без ролика, и опубликуй».
     """
     posts = ctx.get("posts") or []
     plist = "\n".join(f"- #{p['id']}: {p['status']}, {p['head']}" for p in posts) or "нет"
-    hist = "\n".join(f"{h['who']}: {h['text']}" for h in (ctx.get("history") or [])[-12:]) \
+    hist = "\n".join(f"{h['who']}: {h['text']}" for h in (ctx.get("history") or [])[-14:]) \
         or "это первое сообщение"
-    user = f"""Ты — помощник Давида: он ведёт Telegram-канал строительной компании,
-а ты собираешь ему посты. Он пишет обычными словами, без команд.
-Пойми из переписки, чего он хочет прямо сейчас.
+    files = ctx.get("media") or {"photos": 0, "videos": 0}
+    user = f"""Ты — помощник Давида. Он ведёт Telegram-канал строительной компании,
+ты собираешь ему посты. Он пишет обычными словами, без команд, и ждёт,
+что ты поймёшь с первого раза и не будешь переспрашивать очевидное.
 
-Переписка (последние сообщения, старые сверху):
+Переписка (старые сообщения сверху):
 {hist}
 
-Его новое сообщение:
+Новое сообщение от Давида:
 ---
 {text}
 ---
 
 Положение дел:
-- Файлов от него, ещё не собранных в пост: {ctx.get('media_count', 0)}
+- Не разобранных файлов от него: фото {files.get('photos', 0)}, видео {files.get('videos', 0)}
 - Что уже известно про этот материал: {ctx.get('note') or 'ничего'}
-- Посты, ждущие решения или запланированные:
+- Посты в работе:
 {plist}
 
-Действия:
-- "build" — собрать пост из присланных файлов.
-- "note" — он рассказывает про объект, а собирать пока не просил.
-- "queue" — спрашивает, что в работе и когда выйдет.
-- "drop" — убрать, удалить, отменить пост. Заполни post_id.
-- "edit" — переписать или поправить текст готового поста. post_id и instruction.
-- "publish" — опубликовать пост в канал. Заполни post_id.
-- "invent" — придумать пост самому, без его материала.
-- "status" — прямо спрашивает, всё ли работает или что ты умеешь.
-- "smalltalk" — вопрос, уточнение, благодарность, разговор.
+{TOOLBOX}
 
-Как не тупить (это главное):
-1. Если он уже просил собрать пост — хоть подписью к фото, хоть раньше в переписке —
-   договорённость в силе. Всё, что он пишет дальше про объект, это "build",
-   а не "note": детали клади в поле note и собирай. Второй раз спрашивать
-   разрешения нельзя, он это уже сказал.
-2. "note" ставь только когда он рассказывает про объект, а просьбы собрать
-   ещё не было ни разу.
-3. Не переспрашивай то, что уже прозвучало. Перечитай переписку выше.
-4. "status" — только на прямой вопрос «всё работает?» или «что умеешь». Уточняющий
-   вопрос вроде «к чему готов?» — это "smalltalk", и ответь на него по смыслу,
-   своими словами, а не отчётом о состоянии.
-5. Если файлов нет вообще, а он просит собрать пост — "smalltalk", и скажи,
+Как думать:
+1. Разбери фразу целиком, до конца. В ней может быть сразу и задание, и условие,
+   и уточнение: «сделай пост, видео не надо, фото по порядку» — это один вызов
+   make_post с format="photos" и keep_order=true, а не повод переспрашивать.
+2. Отрицание — это условие, а не отдельная просьба. «не нужно монтировать видео»
+   означает format="photos". Никогда не читай отрицание как просьбу что-то удалить.
+3. drop вызывай, только если он явно просит убрать существующий пост и понятно
+   какой. Сомневаешься — не вызывай ничего и спроси в ответе.
+4. Если он уже просил собрать пост — раньше в переписке или подписью к фото, —
+   договорённость в силе. Разрешения второй раз не спрашивают.
+5. Если файлов нет, а он просит собрать — не вызывай инструмент, скажи,
    что ждёшь материал.
-6. Если непонятно, о каком посте речь, и их несколько — "smalltalk" с переспросом.
+6. Не переспрашивай то, что уже прозвучало в переписке.
+7. Если ничего делать не надо — верни пустой список действий и просто ответь.
 
-Поле reply — то, что бот отправит Давиду. Живым языком, на «ты», одна-две строки.
-Без канцелярита, без списков, без markdown, без упоминания команд. Когда берёшь
-материал в работу — назови, что именно взял, чтобы он видел, что ты понял верно.
-Не повторяй то, что уже писал в переписке выше.
+Ответ Давиду (поле reply): живым языком, на «ты», одна-две строки. Без списков,
+без markdown, без канцелярита, без упоминания команд. Если берёшь материал
+в работу — назови, что именно взял и в каком виде соберёшь.
 
 Верни строго JSON:
-{{"action": "одно из перечисленных",
-  "post_id": "номер поста или пустая строка",
-  "instruction": "что поменять, только для edit",
-  "note": "детали про объект из его слов: город, помещение, стадия; иначе пусто",
-  "reply": "ответ Давиду"}}"""
-    data = _json(ask(user, 700, want_json=True))
-    action = str(data.get("action") or "").strip()
-    if action not in ACTIONS:
-        action = "smalltalk"
-    return {
-        "action": action,
-        "post_id": str(data.get("post_id") or "").strip().lstrip("#"),
-        "instruction": str(data.get("instruction") or "").strip(),
-        "note": str(data.get("note") or "").strip(),
-        "reply": str(data.get("reply") or "").strip(),
-    }
+{{"reply": "что написать Давиду",
+  "actions": [{{"tool": "имя инструмента", "args": {{"...": "..."}}}}]}}"""
+    data = _json(ask(user, 900, want_json=True))
+    actions = []
+    for a in (data.get("actions") or [])[:4]:
+        if not isinstance(a, dict):
+            continue
+        tool = str(a.get("tool") or "").strip()
+        if tool in TOOLS:
+            args = a.get("args")
+            actions.append({"tool": tool, "args": args if isinstance(args, dict) else {}})
+    return {"reply": str(data.get("reply") or "").strip(), "actions": actions}
 
 
 def media_ack(note: str, photos: int, videos: int) -> str:
     """Короткая живая реакция на присланный материал."""
-    user = f"""Давид только что прислал тебе материал с объекта:
-фото — {photos}, видео — {videos}.
+    user = f"""Давид только что прислал материал с объекта: фото — {photos}, видео — {videos}.
 Что он написал вместе с ними: {note or "ничего"}.
 
-Ответь ему одной строкой: подтверди, что принял, и скажи, чего не хватает,
-чтобы текст получился конкретным (город, помещение, стадия) — но только если
-он этого ещё не рассказал. Если рассказал достаточно — просто скажи,
-что ждёшь отмашки собирать. На «ты», живым языком, без списков и без команд.
+Ответь одной строкой: подтверди, что принял, и спроси то, чего не хватает для
+конкретного текста (город, помещение, стадия) — только если он этого ещё не сказал.
+Если сказал достаточно — просто спроси, собирать ли. На «ты», без списков и команд.
 Верни только текст ответа."""
     return ask(user, 200).strip().strip('"')
