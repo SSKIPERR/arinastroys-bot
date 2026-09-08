@@ -61,7 +61,7 @@ class S:
     quiet_seconds = _int("QUIET_SECONDS", 240)
     # один прогон живёт несколько минут и всё это время слушает почту,
     # иначе ответы приходили бы раз в десять минут и на разговор не похоже
-    run_seconds = _int("RUN_SECONDS", 240)
+    run_seconds = _int("RUN_SECONDS", 210)
     poll_seconds = _int("POLL_SECONDS", 45)
 
     # --- Монтаж ---
