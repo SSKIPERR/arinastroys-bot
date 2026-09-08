@@ -166,86 +166,114 @@ def remember(st: dict, who: str, text: str) -> None:
     del log_[:-14]
 
 
-def converse(text: str, chat: int, st: dict) -> None:
-    """Разбирает обычную фразу и делает то, о чём попросили."""
+def think(text: str, chat: int, st: dict) -> None:
+    """Один ход разговора: понять, ответить, сделать.
+
+    Модель возвращает ответ и список действий с параметрами, а не один ярлык —
+    поэтому «собери пост, видео не надо, фото по порядку» выполняется как есть.
+    """
     remember(st, "Давид", text)
     batch = st.get("batch") or {}
+    media = batch.get("media") or []
     posts = [
         {"id": pid, "status": ("ждёт решения" if p["status"] == "review" else "запланирован"),
          "head": (p.get("topic") or p.get("text", ""))[:70].replace("\n", " ")}
         for pid, p in sorted(st.get("posts", {}).items(), key=lambda kv: int(kv[0]))
         if p.get("status") in ("review", "scheduled")
     ]
-    ctx = {"media_count": len(batch.get("media") or []),
-           "note": batch.get("note") or "", "posts": posts,
-           "history": st.get("chat_log") or []}
+    ctx = {
+        "media": {"photos": sum(1 for m in media if m["kind"] == "photo"),
+                  "videos": sum(1 for m in media if m["kind"] == "video")},
+        "note": batch.get("note") or "",
+        "posts": posts,
+        "history": st.get("chat_log") or [],
+    }
 
     try:
-        r = brand.route_message(text, ctx)
+        plan = brand.decide(text, ctx)
     except Exception as e:  # noqa: BLE001
         log.warning("не разобрал фразу: %s", e)
-        if batch.get("media"):
+        if media:
             st["batch"]["note"] = f"{batch.get('note','')} {text}".strip()[:700]
             tg.send_message(chat, "Записал. Скажи, когда собирать.")
         else:
             tg.send_message(chat, HELP)
         return
 
-    act = r["action"]
-    log.info("понял как «%s»", act)
-    if r["reply"]:
-        tg.send_message(chat, r["reply"])
-        remember(st, "бот", r["reply"])
+    log.info("решил: %s", [a["tool"] for a in plan["actions"]] or "просто ответить")
+    if plan["reply"]:
+        tg.send_message(chat, plan["reply"])
+        remember(st, "бот", plan["reply"])
 
-    # Детали про объект нужны в тексте поста независимо от того, что он попросил:
-    # «собери пост, это кухня в Химках» — и приказ, и контекст одной фразой.
-    if act in ("note", "build") and (r["note"] or act == "note"):
-        st["batch"] = st.get("batch") or {"media": [], "note": "", "last_ts": int(time.time())}
-        add = r["note"] or text
-        st["batch"]["note"] = f"{st['batch'].get('note','')} {add}".strip()[:700]
-        batch = st["batch"]
+    for act in plan["actions"]:
+        try:
+            run_tool(act["tool"], act["args"], text, chat, st)
+        except Exception as e:  # noqa: BLE001
+            log.exception("действие %s упало", act["tool"])
+            tg.send_message(chat, f"На «{act['tool']}» споткнулся: {e}")
 
-    if act == "build":
-        if batch.get("media"):
-            # Он уже сказал «собирай» — переспрашивать второй раз незачем.
-            st["batch"]["last_ts"] = 0
-            st["batch"]["silent"] = True
-        else:
-            tg.send_message(chat, "Только материала пока нет — пришли фото или видео.")
 
-    elif act == "queue":
-        tg.send_message(chat, queue_text(st))
+def run_tool(tool: str, args: dict, text: str, chat: int, st: dict) -> None:
+    batch = st.get("batch") or {}
 
-    elif act == "status":
-        tg.send_message(chat, health_text(st))
-
-    elif act == "invent":
-        make_auto_post(st, force=True)
-
-    elif act in ("drop", "edit", "publish"):
-        p = st_mod.post(st, r["post_id"])
-        if not p:
-            tg.send_message(chat, "Не понял, о каком посте речь. Вот что сейчас в работе:\n\n"
-                                  + queue_text(st))
+    if tool == "make_post":
+        if not batch.get("media"):
+            tg.send_message(chat, "Материала пока нет — пришли фото или видео.")
             return
-        if act == "drop":
-            p["status"] = "rejected"
-            p["scheduled_at"] = None
-        elif act == "publish":
-            try:
-                mid = publish(p)
-                p["status"] = "published"
-                p["message_id"] = mid
-                tg.send_message(chat, f"Готово. {tg.channel_link(mid)}".strip())
-            except Exception as e:  # noqa: BLE001
-                log.exception("публикация упала")
-                tg.send_message(chat, f"Не смог опубликовать: {e}")
-        else:
-            try:
-                p["text"] = brand.rewrite(p["text"], r["instruction"] or text).strip()
-                resend_preview(st, r["post_id"], "Поправил:")
-            except Exception as e:  # noqa: BLE001
-                tg.send_message(chat, f"Не получилось поправить: {e}")
+        fmt = str(args.get("format") or "auto").lower()
+        batch["format"] = fmt if fmt in ("photos", "reel", "auto") else "auto"
+        batch["keep_order"] = bool(args.get("keep_order"))
+        add = str(args.get("note") or "").strip()
+        if add:
+            batch["note"] = f"{batch.get('note','')} {add}".strip()[:700]
+        batch["last_ts"] = 0          # закроем пачку в этом же заходе
+        batch["silent"] = True        # он уже получил ответ, не дублируем
+        st["batch"] = batch
+        return
+
+    if tool == "show_queue":
+        tg.send_message(chat, queue_text(st))
+        return
+
+    if tool == "health":
+        tg.send_message(chat, health_text(st))
+        return
+
+    if tool == "invent":
+        make_auto_post(st, force=True, topic=str(args.get("topic") or "").strip() or None)
+        return
+
+    pid = str(args.get("post_id") or "").strip().lstrip("#")
+    p = st_mod.post(st, pid)
+    if not p:
+        tg.send_message(chat, "Не понял, о каком посте речь. Вот что в работе:\n\n"
+                              + queue_text(st))
+        return
+
+    if tool == "publish":
+        mid = publish(p)
+        p["status"] = "published"
+        p["message_id"] = mid
+        tg.send_message(chat, f"Опубликовал. {tg.channel_link(mid)}".strip())
+
+    elif tool == "schedule":
+        taken = {q.get("scheduled_at") for q in st.get("posts", {}).values()
+                 if q.get("scheduled_at")}
+        slot = next_slot(taken=taken)
+        p["status"] = "scheduled"
+        p["scheduled_at"] = slot.isoformat()
+        tg.send_message(chat, f"Поставил на {slot:%d.%m %H:%M} по Москве.")
+
+    elif tool == "drop":
+        p["status"] = "rejected"
+        p["scheduled_at"] = None
+
+    elif tool == "rewrite":
+        p["text"] = brand.rewrite(p["text"], str(args.get("how") or text)).strip()
+        resend_preview(st, pid, "Поправил:")
+
+    elif tool == "remake_video":
+        rebuild(st, pid)
 
 
 # ---------------------------------------------------------------- разбор почты
@@ -495,6 +523,28 @@ def download_batch(media: list[dict], folder: Path) -> tuple[list[Path], list[Pa
     return videos, photos, problems
 
 
+def frames_from_video(path: Path, folder: Path, n: int = 3) -> list[Path]:
+    """Пара кадров из ролика, чтобы модели было на что посмотреть."""
+    import subprocess
+    out = []
+    try:
+        dur = float(vid.probe(path).get("format", {}).get("duration") or 0)
+    except Exception:  # noqa: BLE001
+        dur = 0
+    spots = [dur * k / (n + 1) for k in range(1, n + 1)] if dur > 1 else [0.5]
+    for i, at in enumerate(spots):
+        dst = folder / f"eye{i}.jpg"
+        try:
+            subprocess.run(["ffmpeg", "-y", "-ss", f"{at:.2f}", "-i", str(path),
+                            "-frames:v", "1", "-vf", "scale=768:-2", str(dst)],
+                           capture_output=True, timeout=60, check=True)
+            if dst.exists():
+                out.append(dst)
+        except Exception as e:  # noqa: BLE001
+            log.debug("кадр не вынулся: %s", e)
+    return out
+
+
 def build_post(st: dict) -> None:
     batch = st.get("batch") or {}
     media = batch.get("media") or []
@@ -518,12 +568,23 @@ def build_post(st: dict) -> None:
         return
 
     guess, ba = guess_kind(media, note)
+    fmt = batch.get("format") or "auto"
+    if batch.get("keep_order"):
+        ba = False          # он просил не трогать порядок кадров
 
     # ---- текст ----
+    # Модель смотрит на кадры: без этого она пишет «показываем рабочие моменты»
+    # про готовый интерьер. Если фото нет — вынимаем несколько кадров из видео.
+    if photos:
+        eyes = list(photos[:8])
+    elif videos:
+        eyes = frames_from_video(videos[0], folder)
+    else:
+        eyes = []
     try:
         data = brand.caption_for_object(
             guess=guess, note=note, photos=len(photos), videos=len(videos),
-            has_before_after=ba,
+            has_before_after=ba, images=eyes,
         )
     except Exception as e:  # noqa: BLE001
         log.exception("ИИ не ответил")
@@ -542,8 +603,11 @@ def build_post(st: dict) -> None:
                   ph.label(photos[-1], folder / "ba_posle.jpg", "после"))]
         rest = photos[1:-1]
 
+    want_video = fmt == "reel" or (fmt == "auto" and (videos or len(photos) >= 3))
+    if fmt == "photos" and videos:
+        problems.append("видео не монтировал — ты просил только фото")
     video_path = None
-    if videos or len(photos) >= 3:
+    if want_video:
         try:
             title = ph.title_card(folder / "title.jpg", data.get("video_title") or "Объект в работе",
                                   data.get("video_subtitle") or "", photos[0] if photos else None)
@@ -573,6 +637,10 @@ def build_post(st: dict) -> None:
         st["posts"][pid]["review_msg_id"] = msg["message_id"]
     else:
         ready = [ph.to_post(p, folder / f"post{i:02d}.jpg") for i, p in enumerate(photos[:10])]
+        if not ready:
+            tg.send_message(owner, "Фотографий в пачке не оказалось, а видео ты просил не трогать.")
+            st["batch"] = None
+            return
         if len(ready) > 1:
             # грузим по одной, чтобы забрать file_id каждой — по ним потом
             # публикуем в канал без повторной загрузки
@@ -702,13 +770,17 @@ def refill_ideas(st: dict) -> None:
     log.info("добавил %d тем", len(fresh))
 
 
-def make_auto_post(st: dict, force: bool = False) -> str | None:
-    refill_ideas(st)
-    ideas = st.get("ideas", [])
-    if not ideas:
-        tg.send_message(settings.owner_id, "Банк тем пуст, а пополнить не вышло. Проверь /health.")
-        return None
-    idea = ideas.pop(0)
+def make_auto_post(st: dict, force: bool = False, topic: str | None = None) -> str | None:
+    if topic:
+        idea = {"rubric": "expertise", "topic": topic, "brief": ""}
+    else:
+        refill_ideas(st)
+        ideas = st.get("ideas", [])
+        if not ideas:
+            tg.send_message(settings.owner_id,
+                            "Темы кончились, а придумать новые не вышло. Спроси, всё ли работает.")
+            return None
+        idea = ideas.pop(0)
 
     try:
         data = brand.generate_post(idea.get("rubric", "expertise"), idea["topic"],
@@ -796,8 +868,15 @@ def one_round(st: dict, first: bool) -> None:
     # приходит подписью к первому — и в отрыве от остальных читается неверно.
     inbox: dict = {"texts": [], "chat": settings.owner_id, "new_batch": False}
 
+    seen = st.setdefault("seen", [])
     for u in updates:
         st["offset"] = u["update_id"] + 1
+        if u["update_id"] in seen:
+            # два прогона могли пересечься и забрать одну почту — второй раз не отвечаем
+            log.info("событие %s уже разобрано, пропускаю", u["update_id"])
+            continue
+        seen.append(u["update_id"])
+        del seen[:-300]
         try:
             if u.get("message"):
                 handle_message(u["message"], st, inbox)
@@ -814,7 +893,7 @@ def one_round(st: dict, first: bool) -> None:
         n = len((st.get("batch") or {}).get("media") or [])
         if inbox["new_batch"] and n:
             remember(st, "система", f"Давид прислал файлов: {n}")
-        converse(" ".join(inbox["texts"]), inbox["chat"], st)
+        think(" ".join(inbox["texts"]), inbox["chat"], st)
     elif inbox["new_batch"]:
         # файлы пришли молча — коротко подтверждаем и спрашиваем контекст
         batch = st.get("batch") or {}
