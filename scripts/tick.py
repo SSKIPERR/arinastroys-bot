@@ -91,22 +91,139 @@ STRANGER = (
     "Спасибо за интерес к нашей работе."
 )
 
-HELP = """<b>Как со мной работать</b>
+HELP = (
+    "Привет. Кидай сюда фото и видео с объекта и пиши обычными словами — "
+    "никаких команд запоминать не надо.\n\n"
+    "Например: «вот кухня в Химках, до и после, собери пост», «покажи, что в очереди», "
+    "«третий перепиши покороче», «опубликуй».\n\n"
+    "Чем больше расскажешь про объект — город, помещение, стадия, что делали, — "
+    "тем меньше воды будет в тексте. Готовый пост пришлю сюда с кнопками."
+)
 
-Кидай сюда фото и видео с объекта. Я проверяю почту каждые 10 минут,
-поэтому пост приходит не мгновенно — обычно в течение 10–20 минут.
 
-Что написать вместе с материалом (можно подписью к первому файлу):
-город, помещение, стадия — и всё, что стоит упомянуть.
-Чем конкретнее, тем меньше воды в тексте.
+# ---------------------------------------------------------------- сводки
 
-<b>Команды</b>
-/go — не жди, собери пост прямо сейчас
-/queue — что в очереди и когда выйдет
-/drop 5 — убрать пост из очереди
-/now — придумай пост сам
-/health — проверка ключей и прав
-/help — это сообщение"""
+
+def queue_text(st: dict) -> str:
+    rows = [(pid, p) for pid, p in st.get("posts", {}).items()
+            if p.get("status") in ("review", "scheduled")]
+    if not rows:
+        return "Сейчас в работе ничего нет."
+    lines = []
+    for pid, p in sorted(rows, key=lambda kv: int(kv[0])):
+        when = ""
+        if p.get("scheduled_at"):
+            try:
+                when = datetime.fromisoformat(p["scheduled_at"]).strftime("%d.%m %H:%M")
+            except ValueError:
+                when = p["scheduled_at"]
+        mark = "ждёт твоего решения" if p["status"] == "review" else f"выйдет {when} по Москве"
+        head = (p.get("topic") or p.get("text", "")[:60]).replace("\n", " ")
+        lines.append(f"#{pid} · {mark}\n{head}")
+    return "\n\n".join(lines)
+
+
+def health_text(st: dict) -> str:
+    lines = []
+    try:
+        brand.ask("Ответь одним словом: работает", 20)
+        lines.append("Тексты пишу — модель отвечает.")
+    except Exception as e:  # noqa: BLE001
+        lines.append(f"Тексты не пишу: {e}")
+    try:
+        me = tg.call("getMe")
+        member = tg.call("getChatMember", chat_id=settings.channel_id, user_id=me["id"])
+        can = member.get("can_post_messages")
+        lines.append("В канал писать могу." if can or member.get("status") == "creator"
+                     else f"В канал писать не могу: статус {member.get('status')}.")
+    except Exception as e:  # noqa: BLE001
+        lines.append(f"С каналом проблема: {e}")
+    music = [m for m in MUSIC_DIR.iterdir()
+             if m.suffix.lower() in {".mp3", ".m4a", ".wav"}] if MUSIC_DIR.exists() else []
+    lines.append(f"Музыки {len(music)} трек(ов)." if music
+                 else "Музыки нет — ролики пока немые.")
+    lines.append(f"Видео принимаю до {tg.MAX_DOWNLOAD_MB} МБ.")
+    waiting = sum(1 for p in st.get("posts", {}).values()
+                  if p.get("status") in ("review", "scheduled"))
+    lines.append(f"В работе постов: {waiting}. Тем про запас: {len(st.get('ideas', []))}.")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- разговор
+
+
+def converse(text: str, chat: int, st: dict) -> None:
+    """Разбирает обычную фразу и делает то, о чём попросили."""
+    batch = st.get("batch") or {}
+    posts = [
+        {"id": pid, "status": ("ждёт решения" if p["status"] == "review" else "запланирован"),
+         "head": (p.get("topic") or p.get("text", ""))[:70].replace("\n", " ")}
+        for pid, p in sorted(st.get("posts", {}).items(), key=lambda kv: int(kv[0]))
+        if p.get("status") in ("review", "scheduled")
+    ]
+    ctx = {"media_count": len(batch.get("media") or []),
+           "note": batch.get("note") or "", "posts": posts}
+
+    try:
+        r = brand.route_message(text, ctx)
+    except Exception as e:  # noqa: BLE001
+        log.warning("не разобрал фразу: %s", e)
+        if batch.get("media"):
+            st["batch"]["note"] = f"{batch.get('note','')} {text}".strip()[:700]
+            tg.send_message(chat, "Записал. Скажи, когда собирать.")
+        else:
+            tg.send_message(chat, HELP)
+        return
+
+    act = r["action"]
+    log.info("понял как «%s»", act)
+    if r["reply"]:
+        tg.send_message(chat, r["reply"])
+
+    if act == "note":
+        st["batch"] = batch or {"media": [], "note": "", "last_ts": int(time.time())}
+        add = r["note"] or text
+        st["batch"]["note"] = f"{st['batch'].get('note','')} {add}".strip()[:700]
+
+    elif act == "build":
+        if batch.get("media"):
+            st["batch"]["last_ts"] = 0        # закроем пачку в этом же заходе
+        else:
+            tg.send_message(chat, "Только материала пока нет — пришли фото или видео.")
+
+    elif act == "queue":
+        tg.send_message(chat, queue_text(st))
+
+    elif act == "status":
+        tg.send_message(chat, health_text(st))
+
+    elif act == "invent":
+        make_auto_post(st, force=True)
+
+    elif act in ("drop", "edit", "publish"):
+        p = st_mod.post(st, r["post_id"])
+        if not p:
+            tg.send_message(chat, "Не понял, о каком посте речь. Вот что сейчас в работе:\n\n"
+                                  + queue_text(st))
+            return
+        if act == "drop":
+            p["status"] = "rejected"
+            p["scheduled_at"] = None
+        elif act == "publish":
+            try:
+                mid = publish(p)
+                p["status"] = "published"
+                p["message_id"] = mid
+                tg.send_message(chat, f"Готово. {tg.channel_link(mid)}".strip())
+            except Exception as e:  # noqa: BLE001
+                log.exception("публикация упала")
+                tg.send_message(chat, f"Не смог опубликовать: {e}")
+        else:
+            try:
+                p["text"] = brand.rewrite(p["text"], r["instruction"] or text).strip()
+                resend_preview(st, r["post_id"], "Поправил:")
+            except Exception as e:  # noqa: BLE001
+                tg.send_message(chat, f"Не получилось поправить: {e}")
 
 
 # ---------------------------------------------------------------- разбор почты
@@ -155,6 +272,7 @@ def handle_message(msg: dict, st: dict) -> None:
             kind, file_id = "photo", doc["file_id"]
 
     if kind:
+        first = not (st.get("batch") or {}).get("media")
         batch = st.get("batch") or {"media": [], "note": "", "last_ts": 0}
         batch["media"].append({"kind": kind, "file_id": file_id})
         batch["last_ts"] = msg.get("date") or int(time.time())
@@ -162,6 +280,15 @@ def handle_message(msg: dict, st: dict) -> None:
             batch["note"] = f"{batch.get('note','')} {msg['caption']}".strip()[:700]
         st["batch"] = batch
         log.info("принял %s, в пачке %d", kind, len(batch["media"]))
+        if first:
+            # отвечаем один раз за пачку, чтобы не засыпать его сообщениями
+            try:
+                tg.send_message(chat, brand.media_ack(
+                    batch.get("note", ""),
+                    1 if kind == "photo" else 0, 1 if kind == "video" else 0))
+            except Exception:  # noqa: BLE001
+                tg.send_message(chat, "Принял. Кидай остальное и расскажи пару слов "
+                                      "про объект — потом соберу.")
         return
 
     text = (msg.get("text") or "").strip()
@@ -189,11 +316,8 @@ def handle_message(msg: dict, st: dict) -> None:
         handle_command(text, chat, st)
         return
 
-    # ---- обычный текст = комментарий к открытой пачке ----
-    if st.get("batch"):
-        st["batch"]["note"] = f"{st['batch'].get('note','')} {text}".strip()[:700]
-        return
-    tg.send_message(chat, HELP)
+    # ---- всё остальное разбирает модель, командовать не нужно ----
+    converse(text, chat, st)
 
 
 def handle_command(text: str, chat: int, st: dict) -> None:
@@ -211,24 +335,7 @@ def handle_command(text: str, chat: int, st: dict) -> None:
             tg.send_message(chat, "Пачка пустая — сначала пришли материал.")
 
     elif cmd == "/queue":
-        rows = [(pid, p) for pid, p in st.get("posts", {}).items()
-                if p.get("status") in ("review", "scheduled")]
-        if not rows:
-            tg.send_message(chat, "Очередь пустая.")
-            return
-        lines = ["<b>В работе</b>", ""]
-        for pid, p in sorted(rows, key=lambda kv: int(kv[0])):
-            when = ""
-            if p.get("scheduled_at"):
-                try:
-                    when = datetime.fromisoformat(p["scheduled_at"]).strftime("%d.%m %H:%M")
-                except ValueError:
-                    when = p["scheduled_at"]
-            mark = "ждёт решения" if p["status"] == "review" else f"выйдет {when} МСК"
-            head = (p.get("topic") or p.get("text", "")[:60]).replace("\n", " ")
-            lines.append(f"#{pid} · {mark}\n{head}")
-        lines.append("\nУбрать: /drop 5")
-        tg.send_message(chat, "\n\n".join(lines))
+        tg.send_message(chat, queue_text(st))
 
     elif cmd == "/drop":
         p = st_mod.post(st, arg.strip())
@@ -244,28 +351,7 @@ def handle_command(text: str, chat: int, st: dict) -> None:
         make_auto_post(st, force=True)
 
     elif cmd == "/health":
-        lines = []
-        try:
-            out = brand.ask("Ответь одним словом: работает", 20)
-            lines.append(f"ИИ: {out[:40]}")
-        except Exception as e:  # noqa: BLE001
-            lines.append(f"ИИ: ошибка — {e}")
-        try:
-            me = tg.call("getMe")
-            member = tg.call("getChatMember", chat_id=settings.channel_id, user_id=me["id"])
-            lines.append(f"Канал: статус бота {member.get('status')}"
-                         f" · публикация: {member.get('can_post_messages')}")
-        except Exception as e:  # noqa: BLE001
-            lines.append(f"Канал: ошибка — {e}")
-        fonts = [f.name for f in FONTS_DIR.glob("*.ttf")]
-        music = [m for m in MUSIC_DIR.iterdir()
-                 if m.suffix.lower() in {".mp3", ".m4a", ".wav"}]
-        lines.append(f"Шрифты: {', '.join(fonts) if fonts else 'нет, будет системный'}")
-        lines.append(f"Музыка: {len(music)} трек(ов)" if music else "Музыка: нет, ролики немые")
-        lines.append(f"Файлы: лимит {tg.MAX_DOWNLOAD_MB} МБ (облачный Bot API)")
-        lines.append(f"В очереди: {sum(1 for p in st.get('posts', {}).values() if p.get('status') in ('review','scheduled'))}")
-        lines.append(f"Тем в банке: {len(st.get('ideas', []))}")
-        tg.send_message(chat, "\n\n".join(lines))
+        tg.send_message(chat, health_text(st))
 
     else:
         tg.send_message(chat, HELP)
@@ -655,22 +741,11 @@ def make_auto_post(st: dict, force: bool = False) -> str | None:
 # ---------------------------------------------------------------- вход
 
 
-def main() -> int:
-    if not settings.token or not settings.owner_id or not settings.channel_id:
-        log.error("не заданы TELEGRAM_BOT_TOKEN / OWNER_ID / CHANNEL_ID")
-        return 1
-
-    st = st_mod.load()
-    log.info("состояние: offset=%s, постов=%d, тем=%d",
-             st["offset"], len(st.get("posts", {})), len(st.get("ideas", [])))
-
-    try:
-        # Без offset: Telegram отдаёт всё неподтверждённое и НИЧЕГО не вычёркивает.
-        # Подтверждаем сами в конце — так offset физически не может убежать вперёд.
-        raw = tg.get_updates(0, poll=20)
-    except Exception as e:  # noqa: BLE001
-        log.error("почту забрать не вышло: %s", e)
-        return 1
+def one_round(st: dict, first: bool) -> None:
+    """Один круг: забрать почту, ответить, собрать пачку, опубликовать что пора."""
+    # Без offset: Telegram отдаёт всё неподтверждённое и НИЧЕГО не вычёркивает.
+    # Подтверждаем сами в конце — так offset физически не может убежать вперёд.
+    raw = tg.get_updates(0, poll=settings.poll_seconds)
 
     updates = [u for u in raw if u["update_id"] >= st["offset"]]
     if raw and not updates:
@@ -678,42 +753,23 @@ def main() -> int:
                     st["offset"], raw[0]["update_id"])
         st["offset"] = raw[0]["update_id"]
         updates = raw
-    log.info("в очереди: %d, из них новых: %d", len(raw), len(updates))
+    if raw or first:
+        log.info("в очереди: %d, из них новых: %d", len(raw), len(updates))
 
-    if not raw:
-        # Почта пуста — выясняем, чья это пустота: Telegram молчит или мы не туда смотрим.
+    if not raw and first:
+        # Первый пустой круг — заодно проверяем, что почта вообще ходит.
         try:
             who = tg.me()
             log.info("диагностика · бот: @%s (id=%s)", who.get("username"), who.get("id"))
-        except Exception as e:  # noqa: BLE001
-            log.error("диагностика · getMe не ответил: %s", e)
-        try:
             wh = tg.webhook_info()
             if wh.get("url"):
-                log.error("диагностика · ВЕБХУК ЗАНЯТ: %s — длинный опрос не получит НИЧЕГО",
+                log.error("диагностика · ВЕБХУК ЗАНЯТ: %s — длинный опрос ничего не получит",
                           wh["url"])
             else:
-                log.info("диагностика · вебхук не стоит, очередь ждёт: %s, последняя ошибка: %s",
-                         wh.get("pending_update_count"), wh.get("last_error_message") or "нет")
+                log.info("диагностика · вебхука нет, в очереди ждёт: %s",
+                         wh.get("pending_update_count"))
         except Exception as e:  # noqa: BLE001
-            log.error("диагностика · getWebhookInfo не ответил: %s", e)
-        try:
-            tail = tg.peek_updates()
-            if not tail:
-                log.info("диагностика · очередь Telegram действительно пуста — "
-                         "события до бота не доходят")
-            else:
-                u = tail[-1]
-                kind = next((k for k in ("message", "callback_query", "channel_post",
-                                         "my_chat_member") if u.get(k)), "?")
-                log.info("диагностика · последнее событие: update_id=%s, тип=%s, наш offset=%s",
-                         u.get("update_id"), kind, st["offset"])
-                if u.get("update_id", 0) + 1 < st["offset"]:
-                    log.error("диагностика · offset УБЕЖАЛ ВПЕРЁД: просим %s, "
-                              "а Telegram отдаёт максимум %s — всё новое отбрасывается",
-                              st["offset"], u.get("update_id"))
-        except Exception as e:  # noqa: BLE001
-            log.error("диагностика · peek не ответил: %s", e)
+            log.error("диагностика не прошла: %s", e)
 
     for u in updates:
         st["offset"] = u["update_id"] + 1
@@ -752,8 +808,35 @@ def main() -> int:
             log.info("пачка ещё набирается (тишина %.0f с)", quiet)
 
     publish_due(st)
-    st_mod.save(st)
-    log.info("готово, offset=%s", st["offset"])
+
+
+def main() -> int:
+    if not settings.token or not settings.owner_id or not settings.channel_id:
+        log.error("не заданы TELEGRAM_BOT_TOKEN / OWNER_ID / CHANNEL_ID")
+        return 1
+
+    st = st_mod.load()
+    log.info("состояние: offset=%s, постов=%d, тем=%d",
+             st["offset"], len(st.get("posts", {})), len(st.get("ideas", [])))
+
+    # Один прогон слушает почту несколько минут подряд: пингер будит нас
+    # реже, чем хочется живому диалогу, поэтому внутри крутим свой цикл.
+    deadline = time.time() + settings.run_seconds
+    rounds = 0
+    while True:
+        rounds += 1
+        try:
+            one_round(st, first=(rounds == 1))
+        except Exception as e:  # noqa: BLE001
+            log.exception("круг %d упал", rounds)
+            if rounds == 1:
+                st_mod.save(st)
+                return 1
+        st_mod.save(st)
+        if time.time() >= deadline:
+            break
+
+    log.info("готово: кругов %d, offset=%s", rounds, st["offset"])
     return 0
 
 
