@@ -529,6 +529,55 @@ def download_batch(media: list[dict], folder: Path) -> tuple[list[Path], list[Pa
     return videos, photos, problems
 
 
+def tidy_photos(photos: list[Path], folder: Path, note: str,
+                problems: list[str]) -> tuple[list[Path], list[dict], list[str]]:
+    """Осмотр кадров моделью: чистим от наложенного текста, находим пары до/после."""
+    try:
+        info = brand.inspect_photos(photos[:8], note)
+    except Exception as e:  # noqa: BLE001
+        log.warning("осмотр кадров не удался: %s", e)
+        return photos, [], []
+
+    out = list(photos)
+    cleaned = 0
+    for ph_info in info.get("photos", []):
+        if not ph_info.get("clutter"):
+            continue
+        i = ph_info["i"]
+        src = out[i]
+        dst = folder / f"clean{i:02d}.jpg"
+        ok = False
+        try:
+            ok = brand.clean_photo(src, dst, ph_info.get("what", ""))
+        except Exception as e:  # noqa: BLE001
+            log.warning("чистка кадра %d упала: %s", i, e)
+        if not ok:
+            try:
+                ok = brand.crop_edge(src, dst, ph_info.get("where", ""))
+                if ok:
+                    log.info("кадр %d: обрезал край %s", i, ph_info.get("where"))
+            except Exception as e:  # noqa: BLE001
+                log.warning("обрезка кадра %d упала: %s", i, e)
+        if ok:
+            out[i] = dst
+            cleaned += 1
+        else:
+            problems.append(f"на кадре {i + 1} лишнее ({ph_info.get('what') or 'текст'}), "
+                            f"убрать не смог")
+    if cleaned:
+        log.info("очищено кадров: %d", cleaned)
+    rooms = [x["room"] for x in info.get("photos", []) if x.get("room")]
+    rooms = list(dict.fromkeys(rooms))
+    return out, info.get("pairs", []), rooms
+
+
+def pick_theme(st: dict) -> str:
+    """Чередуем светлую и тёмную тему, чтобы лента не сливалась."""
+    posts = sorted(st.get("posts", {}).items(), key=lambda kv: int(kv[0]))
+    last = next((p.get("theme") for _, p in reversed(posts) if p.get("theme")), None)
+    return "light" if last == "dark" else "dark"
+
+
 def frames_from_video(path: Path, folder: Path, n: int = 3) -> list[Path]:
     """Пара кадров из ролика, чтобы модели было на что посмотреть."""
     import subprocess
@@ -578,6 +627,16 @@ def build_post(st: dict) -> None:
     if batch.get("keep_order"):
         ba = False          # он просил не трогать порядок кадров
 
+    # ---- осмотр кадров: лишнее убрать, пары до/после найти ----
+    pairs_idx: list[dict] = []
+    if photos:
+        photos, pairs_idx, seen_rooms = tidy_photos(photos, folder, note, problems)
+        if pairs_idx:
+            ba = True
+            guess = "до/после"
+        elif seen_rooms:
+            guess = f"{guess}: {', '.join(seen_rooms[:4])}"
+
     # ---- текст ----
     # Модель смотрит на кадры: без этого она пишет «показываем рабочие моменты»
     # про готовый интерьер. Если фото нет — вынимаем несколько кадров из видео.
@@ -604,9 +663,32 @@ def build_post(st: dict) -> None:
     # ---- картинка или ролик ----
     pairs = []
     rest = photos
-    if ba and len(photos) >= 2:
+    ba_cards: list[Path] = []
+    if pairs_idx:
+        used = set()
+        for k, pr in enumerate(pairs_idx):
+            b_, a_ = photos[pr["before"]], photos[pr["after"]]
+            used.update((pr["before"], pr["after"]))
+            pairs.append((ph.label(b_, folder / f"ba{k}_do.jpg", "до"),
+                          ph.label(a_, folder / f"ba{k}_posle.jpg", "после")))
+            style = cards.BA_STYLES[(k + len(st.get("posts", {}))) % len(cards.BA_STYLES)]
+            try:
+                ba_cards.append(cards.before_after(
+                    folder / f"ba{k}_card.jpg", b_, a_,
+                    title=(data.get("video_title") or "") if k == 0 else "",
+                    style=style, theme=pick_theme(st)))
+            except Exception as e:  # noqa: BLE001
+                log.warning("карточка до/после не собралась: %s", e)
+        rest = [p_ for i, p_ in enumerate(photos) if i not in used]
+    elif ba and len(photos) >= 2:
         pairs = [(ph.label(photos[0], folder / "ba_do.jpg", "до"),
                   ph.label(photos[-1], folder / "ba_posle.jpg", "после"))]
+        try:
+            ba_cards.append(cards.before_after(folder / "ba_card.jpg", photos[0], photos[-1],
+                                               title=data.get("video_title") or "",
+                                               style="side", theme=pick_theme(st)))
+        except Exception as e:  # noqa: BLE001
+            log.warning("карточка до/после не собралась: %s", e)
         rest = photos[1:-1]
 
     want_video = fmt == "reel" or (fmt == "auto" and (videos or len(photos) >= 3))
@@ -634,6 +716,7 @@ def build_post(st: dict) -> None:
     pid = st_mod.new_post(
         st, text=caption, topic=(note or guess)[:120], source="object",
         sources=[m["file_id"] for m in media], note=note,
+        theme=pick_theme(st) if ba_cards else None,
     )
 
     if video_path and video_path.exists():
@@ -642,7 +725,9 @@ def build_post(st: dict) -> None:
         st["posts"][pid]["video_file_id"] = tg.file_id_of(msg)
         st["posts"][pid]["review_msg_id"] = msg["message_id"]
     else:
-        ready = [ph.to_post(p, folder / f"post{i:02d}.jpg") for i, p in enumerate(photos[:10])]
+        plain = rest if ba_cards else photos
+        ready = ba_cards + [ph.to_post(p, folder / f"post{i:02d}.jpg")
+                            for i, p in enumerate(plain[: 10 - len(ba_cards)])]
         if not ready:
             tg.send_message(owner, "Фотографий в пачке не оказалось, а видео ты просил не трогать.")
             st["batch"] = None
@@ -794,6 +879,7 @@ def render_card(st: dict, folder: Path, data: dict, idea: dict):
             label=brand.RUBRICS.get(idea.get("rubric", ""), "").split(" —")[0],
             layout=data.get("card_layout", "band"),
             hero=data.get("card_hero", ""),
+            theme=data.get("card_theme", "light"),
         )
     except Exception as e:  # noqa: BLE001
         log.warning("карточка не нарисовалась: %s", e)
@@ -812,10 +898,12 @@ def regenerate_post(st: dict, pid: str, feedback: str) -> None:
         data = brand.generate_post(idea["rubric"], idea["topic"], idea["brief"],
                                    st.get("used_topics", []),
                                    feedback=feedback, previous=p.get("text", ""),
-                                   avoid_layouts=list({p.get("card"), *recent_layouts(st)} - {None}))
+                                   avoid_layouts=list({p.get("card"), *recent_layouts(st)} - {None}),
+                                   theme="light" if p.get("theme") == "dark" else "dark")
         card = render_card(st, folder, data, idea)
         p["text"] = build_caption(data.get("text", ""), data.get("hashtags"))
         p["card"] = data.get("card_layout")
+        p["theme"] = data.get("card_theme")
         body = f"{p['text']}\n\n———\nПеределал (макет: {p['card']}):"
         if card:
             msg = tg.send_photo(owner, card, body, kb_review(pid, False))
@@ -861,7 +949,7 @@ def make_auto_post(st: dict, force: bool = False, topic: str | None = None) -> s
     try:
         data = brand.generate_post(idea.get("rubric", "expertise"), idea["topic"],
                                    idea.get("brief", ""), st.get("used_topics", []),
-                                   avoid_layouts=recent_layouts(st))
+                                   avoid_layouts=recent_layouts(st), theme=pick_theme(st))
     except Exception as e:  # noqa: BLE001
         log.exception("автопост не написался")
         tg.send_message(settings.owner_id, f"Не смог написать автопост: {e}")
@@ -876,7 +964,7 @@ def make_auto_post(st: dict, force: bool = False, topic: str | None = None) -> s
 
     pid = st_mod.new_post(st, text=caption, topic=idea["topic"], source="auto",
                           rubric=idea.get("rubric"), sources=[], brief=idea.get("brief", ""),
-                          card=data.get("card_layout"))
+                          card=data.get("card_layout"), theme=data.get("card_theme"))
     remember(st, "система", f"показал пост #{pid} (автопост, макет {data.get('card_layout')}): "
                             f"{idea['topic'][:80]}")
 
