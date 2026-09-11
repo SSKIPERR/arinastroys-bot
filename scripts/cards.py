@@ -672,9 +672,16 @@ def card_stats(dst: Path, title: str, lines: list[str], label: str = "",
         bot = H - foot - int(m * 0.5)
         slot = (bot - top) / len(items)
         fd = font("text", 30)
+        fvb = font("text-bold", 34)
         for i, it in enumerate(items):
             num, cap = split_item(it)
             cy = top + slot * i
+            if len(num) > 14 or not cap:
+                # это не число, а фраза — рисуем как обычный пункт, без гигантского кегля
+                _item(d, m, cy + 10, it, box, fvb, fd, t=t)
+                if i < len(items) - 1:
+                    d.line([(m, cy + slot - 10), (W - m, cy + slot - 10)], fill=t.hair, width=2)
+                continue
             fn = font("display", 40)
             for sz in range(min(int(slot * 0.66), 150), 48, -4):
                 fn = font("display", sz)
@@ -794,7 +801,11 @@ def card_myth(dst: Path, title: str, lines: list[str], label: str = "",
 
 def card_table(dst: Path, title: str, lines: list[str], label: str = "",
                size=POST, theme: str = "light") -> Path:
-    """Макет «таблица»: строки «параметр — значение», значение прижато вправо."""
+    """Макет «таблица»: строки «параметр — значение».
+
+    Короткое значение («4%», «28 дней») прижато вправо крупно; длинное — идёт
+    второй строкой под параметром, иначе они наезжают друг на друга.
+    """
     W, H = size
     img, d, t, m, foot = _canvas(size, theme)
     _head(d, W, m, label, t.muted)
@@ -811,18 +822,32 @@ def card_table(dst: Path, title: str, lines: list[str], label: str = "",
         top = y
         bot = H - foot - int(m * 0.5)
         slot = (bot - top) / len(items)
-        fk = font("text", 30)
-        fv = font("display", 38)
+        fk = font("text", 30 if len(items) <= 5 else 27)
+        fv = font("display", 38 if len(items) <= 5 else 34)
+        fkm = font("mono", 22)
+        fvb = font("text-bold", 32 if len(items) <= 5 else 28)
         for i, it in enumerate(items):
             k, v = split_item(it)
             cy = top + slot * i
             vw = d.textlength(v.upper(), font=fv) if v else 0
-            for ln in wrap(d, k, fk, box - vw - 30)[:2]:
-                d.text((m, cy + slot / 2 - fk.size * 0.7), ln, font=fk, fill=t.soft)
-                cy += int(fk.size * 1.2)
-            if v:
-                d.text((W - m - vw, top + slot * i + slot / 2 - fv.size * 0.62), v.upper(),
+            short = bool(v) and vw <= box * 0.42 and len(v) <= 18
+            if short:
+                kl = wrap(d, k, fk, box - vw - 40)[:2]
+                ky = cy + slot / 2 - len(kl) * fk.size * 0.62
+                for ln in kl:
+                    d.text((m, ky), ln, font=fk, fill=t.soft)
+                    ky += int(fk.size * 1.2)
+                d.text((W - m - vw, cy + slot / 2 - fv.size * 0.62), v.upper(),
                        font=fv, fill=t.fg)
+            else:
+                # длинное значение — параметр мелко сверху, значение жирно снизу
+                tracked(d, (m, cy + 14), k.upper(), fkm, t.muted, 3)
+                vy = cy + 14 + fkm.size + 12
+                for ln in wrap(d, v or k, fvb, box)[:2]:
+                    if vy + fvb.size > cy + slot - 6:
+                        break
+                    d.text((m, vy), ln, font=fvb, fill=t.fg)
+                    vy += int(fvb.size * 1.22)
             d.line([(m, top + slot * (i + 1)), (W - m, top + slot * (i + 1))], fill=t.hair, width=2)
     return _save(img, d, size, foot, t, dst)
 
