@@ -163,7 +163,7 @@ def remember(st: dict, who: str, text: str) -> None:
     """Складываем переписку, иначе каждая фраза читается в отрыве от предыдущей."""
     log_ = st.setdefault("chat_log", [])
     log_.append({"who": who, "text": (text or "").strip()[:400]})
-    del log_[:-14]
+    del log_[:-20]
 
 
 def think(text: str, chat: int, st: dict) -> None:
@@ -181,11 +181,17 @@ def think(text: str, chat: int, st: dict) -> None:
         for pid, p in sorted(st.get("posts", {}).items(), key=lambda kv: int(kv[0]))
         if p.get("status") in ("review", "scheduled")
     ]
+    shown = [(pid, p) for pid, p in sorted(st.get("posts", {}).items(), key=lambda kv: int(kv[0]))
+             if p.get("review_msg_id")]
+    last = ({"id": shown[-1][0],
+             "head": (shown[-1][1].get("topic") or shown[-1][1].get("text", ""))[:70]}
+            if shown else {})
     ctx = {
         "media": {"photos": sum(1 for m in media if m["kind"] == "photo"),
                   "videos": sum(1 for m in media if m["kind"] == "video")},
         "note": batch.get("note") or "",
         "posts": posts,
+        "last_post": last,
         "history": st.get("chat_log") or [],
     }
 
@@ -271,6 +277,9 @@ def run_tool(tool: str, args: dict, text: str, chat: int, st: dict) -> None:
     elif tool == "rewrite":
         p["text"] = brand.rewrite(p["text"], str(args.get("how") or text)).strip()
         resend_preview(st, pid, "Поправил:")
+
+    elif tool == "remake":
+        regenerate_post(st, pid, str(args.get("feedback") or text))
 
     elif tool == "remake_video":
         rebuild(st, pid)
@@ -456,13 +465,10 @@ def handle_callback(cb: dict, st: dict) -> None:
         )
 
     elif action == "retext":
-        tg.answer_callback(cb["id"], "Переписываю…")
+        tg.answer_callback(cb["id"], "Переделываю…")
         try:
-            p["text"] = brand.rewrite(
-                p["text"], "Напиши этот пост заново, другим заходом и другой первой "
-                           "строкой. Смысл сохрани."
-            ).strip()
-            resend_preview(st, pid, "Переписал:")
+            # кнопка переделывает пост целиком: у автопоста заодно меняется макет
+            regenerate_post(st, pid, "переделай заново, другим заходом и другой первой строкой")
         except Exception as e:  # noqa: BLE001
             tg.send_message(chat, f"Не переписалось: {e}")
 
@@ -654,6 +660,7 @@ def build_post(st: dict) -> None:
             ids = [fid for fid in [tg.file_id_of(msg)] if fid]
         st["posts"][pid]["photo_file_ids"] = [i for i in ids if i]
         st["posts"][pid]["review_msg_id"] = msg["message_id"]
+    remember(st, "система", f"показал пост #{pid} по материалу с объекта: {(note or guess)[:80]}")
 
     st["batch"] = None
     log.info("пост #%s собран", pid)
@@ -713,6 +720,7 @@ def resend_preview(st: dict, pid: str, header: str) -> None:
     else:
         msg = tg.send_message(owner, body, kbd)
     p["review_msg_id"] = msg["message_id"]
+    remember(st, "система", f"показал пост #{pid} ({header.rstrip(':').lower()})")
 
 
 # ---------------------------------------------------------------- публикация
@@ -770,6 +778,74 @@ def refill_ideas(st: dict) -> None:
     log.info("добавил %d тем", len(fresh))
 
 
+def recent_layouts(st: dict, n: int = 3) -> list[str]:
+    """Макеты последних карточек — чтобы следующая не выглядела как предыдущая."""
+    posts = sorted(st.get("posts", {}).items(), key=lambda kv: int(kv[0]))
+    return [p.get("card") for _, p in posts if p.get("card")][-n:]
+
+
+def render_card(st: dict, folder: Path, data: dict, idea: dict):
+    folder.mkdir(parents=True, exist_ok=True)
+    try:
+        return cards.make(
+            folder / "card.jpg",
+            title=data.get("card_title") or idea["topic"],
+            lines=data.get("card_lines") or [],
+            label=brand.RUBRICS.get(idea.get("rubric", ""), "").split(" —")[0],
+            layout=data.get("card_layout", "band"),
+            hero=data.get("card_hero", ""),
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("карточка не нарисовалась: %s", e)
+        return None
+
+
+def regenerate_post(st: dict, pid: str, feedback: str) -> None:
+    """Переделать пост целиком: и текст, и картинку, с учётом замечаний."""
+    p = st_mod.post(st, pid)
+    owner = settings.owner_id
+    folder = WORK / f"redo{pid}_{int(time.time())}"
+
+    if p.get("source") == "auto":
+        idea = {"rubric": p.get("rubric") or "expertise", "topic": p.get("topic") or "",
+                "brief": p.get("brief") or ""}
+        data = brand.generate_post(idea["rubric"], idea["topic"], idea["brief"],
+                                   st.get("used_topics", []),
+                                   feedback=feedback, previous=p.get("text", ""),
+                                   avoid_layouts=list({p.get("card"), *recent_layouts(st)} - {None}))
+        card = render_card(st, folder, data, idea)
+        p["text"] = build_caption(data.get("text", ""), data.get("hashtags"))
+        p["card"] = data.get("card_layout")
+        body = f"{p['text']}\n\n———\nПеределал (макет: {p['card']}):"
+        if card:
+            msg = tg.send_photo(owner, card, body, kb_review(pid, False))
+            p["photo_file_ids"] = [i for i in [tg.file_id_of(msg)] if i]
+        else:
+            msg = tg.send_message(owner, body, kb_review(pid, False))
+        p["review_msg_id"] = msg["message_id"]
+        remember(st, "система", f"показал переделанный пост #{pid}, макет {p['card']}")
+        return
+
+    # пост с объекта: заново смотрим на кадры и пишем текст с учётом замечаний
+    folder.mkdir(parents=True, exist_ok=True)
+    photos = []
+    for i, fid in enumerate(p.get("sources", [])[:8]):
+        dest = folder / f"{i:03d}.jpg"
+        try:
+            tg.download(fid, dest)
+            photos.append(dest)
+        except Exception as e:  # noqa: BLE001
+            log.warning("исходник не скачался: %s", e)
+    data = brand.caption_for_object(
+        guess=p.get("topic") or "объект", note=p.get("note") or "",
+        photos=len(photos), videos=1 if p.get("video_file_id") else 0,
+        has_before_after=False, images=photos,
+        feedback=feedback, previous=p.get("text", ""),
+    )
+    p["text"] = build_caption(data.get("text", ""), data.get("hashtags"))
+    resend_preview(st, pid, "Переделал текст:")
+
+
 def make_auto_post(st: dict, force: bool = False, topic: str | None = None) -> str | None:
     if topic:
         idea = {"rubric": "expertise", "topic": topic, "brief": ""}
@@ -784,33 +860,25 @@ def make_auto_post(st: dict, force: bool = False, topic: str | None = None) -> s
 
     try:
         data = brand.generate_post(idea.get("rubric", "expertise"), idea["topic"],
-                                   idea.get("brief", ""), st.get("used_topics", []))
+                                   idea.get("brief", ""), st.get("used_topics", []),
+                                   avoid_layouts=recent_layouts(st))
     except Exception as e:  # noqa: BLE001
         log.exception("автопост не написался")
         tg.send_message(settings.owner_id, f"Не смог написать автопост: {e}")
         return None
 
     folder = WORK / f"auto{int(time.time())}"
-    folder.mkdir(parents=True, exist_ok=True)
-    card = None
-    try:
-        card = cards.make(
-            folder / "card.jpg",
-            title=data.get("card_title") or idea["topic"],
-            lines=data.get("card_lines") or [],
-            label=brand.RUBRICS.get(idea.get("rubric", ""), "").split(" —")[0],
-            layout=data.get("card_layout", "band"),
-            hero=data.get("card_hero", ""),
-        )
-    except Exception as e:  # noqa: BLE001
-        log.warning("карточка не нарисовалась: %s", e)
+    card = render_card(st, folder, data, idea)
 
     caption = build_caption(data.get("text", ""), data.get("hashtags"))
     taken = {q.get("scheduled_at") for q in st.get("posts", {}).values() if q.get("scheduled_at")}
     slot = next_slot(taken=taken)
 
     pid = st_mod.new_post(st, text=caption, topic=idea["topic"], source="auto",
-                          rubric=idea.get("rubric"), sources=[])
+                          rubric=idea.get("rubric"), sources=[], brief=idea.get("brief", ""),
+                          card=data.get("card_layout"))
+    remember(st, "система", f"показал пост #{pid} (автопост, макет {data.get('card_layout')}): "
+                            f"{idea['topic'][:80]}")
 
     if card:
         msg = tg.send_photo(settings.owner_id, card,
