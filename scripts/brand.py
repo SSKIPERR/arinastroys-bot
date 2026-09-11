@@ -108,8 +108,10 @@ def shrink(path, side: int = 768, quality: int = 78) -> str:
 
 
 def ask(user: str, max_tokens: int = 1600, want_json: bool = False,
-        images: list | None = None) -> str:
-    return _ask_gemini(user, max_tokens, want_json, images) if provider() == "gemini" \
+        images: list | None = None, think: int = 0) -> str:
+    """think — бюджет токенов на размышление до ответа. Ноль — отвечать сразу.
+    Для разбора фраз Давида включаем: модель заметно точнее читает контекст."""
+    return _ask_gemini(user, max_tokens, want_json, images, think) if provider() == "gemini" \
         else _ask_anthropic(user, max_tokens, images)
 
 
@@ -131,14 +133,14 @@ def _gemini_chain() -> list[str]:
 
 def _gemini_once(model: str, user: str, max_tokens: int,
                  want_json: bool = False,
-                 images: list | None = None) -> tuple[str | None, str]:
+                 images: list | None = None, think: int = 0) -> tuple[str | None, str]:
     """Один заход. Возвращает (текст или None, описание проблемы)."""
-    cfg: dict = {"maxOutputTokens": max_tokens, "temperature": 0.85}
+    # размышление входит в лимит выходных токенов — иначе ответ обрывается
+    cfg: dict = {"maxOutputTokens": max_tokens + think, "temperature": 0.85}
     if want_json:
         # без этого модель обрамляет JSON пояснениями, и разбор падает
         cfg["responseMimeType"] = "application/json"
-    # модели Gemini 3 тратят часть бюджета на размышления, и ответ обрывается
-    cfg["thinkingConfig"] = {"thinkingBudget": 0}
+    cfg["thinkingConfig"] = {"thinkingBudget": think}
     try:
         r = requests.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
@@ -180,18 +182,20 @@ def _parts(user: str, images: list | None) -> list[dict]:
 
 
 # коды, при которых имеет смысл подождать и повторить
+LAYOUTS_ALL = {"band", "grid", "hero", "split", "quote", "steps", "versus"}
+
 RETRY_CODES = ("HTTP 429", "HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504", "сеть")
 
 
 def _ask_gemini(user: str, max_tokens: int, want_json: bool = False,
-                images: list | None = None) -> str:
+                images: list | None = None, think: int = 0) -> str:
     if not GEMINI_KEY:
         raise LLMError("не задан GEMINI_API_KEY")
 
     problems: list[str] = []
     for model in _gemini_chain():
         for attempt in range(3):
-            text, why = _gemini_once(model, user, max_tokens, want_json, images)
+            text, why = _gemini_once(model, user, max_tokens, want_json, images, think)
             if text:
                 if problems:
                     log.info("получилось на %s после %d осечек", model, len(problems))
@@ -259,10 +263,21 @@ def _json(text: str) -> Any:
 
 
 def caption_for_object(*, guess: str, note: str, photos: int, videos: int,
-                       has_before_after: bool, images: list | None = None) -> dict:
+                       has_before_after: bool, images: list | None = None,
+                       feedback: str = "", previous: str = "") -> dict:
     """Пишет пост по материалу. Картинки уходят в модель — она пишет о том, что видит."""
+    redo = ""
+    if previous or feedback:
+        redo = f"""
+ЭТО ПЕРЕДЕЛКА. Прошлую версию Давид забраковал.
+Его замечание: {feedback or "не понравилось, сделай сильнее"}
+Прошлый текст (не повторяй ни структуру, ни первую строку):
+---
+{previous[:1500] or "нет"}
+---
+"""
     user = f"""Собери пост для Telegram-канала по материалу с объекта.
-
+{redo}
 {"Кадры приложены выше — смотри на них и пиши о том, что на них действительно есть."
  if images else "Кадры приложить не удалось, пиши по комментарию."}
 
@@ -297,14 +312,45 @@ def caption_for_object(*, guess: str, note: str, photos: int, videos: int,
     return data
 
 
-def generate_post(rubric: str, topic: str, brief: str = "", avoid: list[str] | None = None) -> dict:
+LAYOUT_GUIDE = """Макеты картинки (все в одном фирменном стиле, но выглядят по-разному):
+- "hero"   — есть ударное число или 1-2 слова («28 дней», «Ноль доплат»). Заполни card_hero.
+- "steps"  — процесс по порядку: этапы, последовательность, «сначала — потом». 4-6 пунктов.
+- "versus" — ошибки против правильного: пункты идут ПАРАМИ, нечётный — «так нельзя»,
+             чётный — «так правильно». 4 или 6 пунктов.
+- "grid"   — 4 или 6 равнозначных пунктов без порядка: критерии, признаки, что входит.
+- "split"  — короткий заголовок в 2-4 слова и 3-5 пунктов с пояснениями.
+- "quote"  — одна сильная мысль, которую хочется прочитать целиком; 1-3 пояснения.
+- "band"   — универсальный: заголовок и 3-5 пунктов."""
+
+
+def generate_post(rubric: str, topic: str, brief: str = "", avoid: list[str] | None = None,
+                  feedback: str = "", previous: str = "",
+                  avoid_layouts: list[str] | None = None) -> dict:
+    """Пишет автопост и описывает картинку к нему.
+
+    feedback/previous — когда Давид забраковал прошлую версию: что не так и что было.
+    avoid_layouts — макеты последних постов, чтобы лента не выглядела одинаково.
+    """
     avoid_s = "\n".join(f"- {t}" for t in (avoid or [])[:20]) or "нет"
+    banned = [l for l in (avoid_layouts or []) if l in LAYOUTS_ALL]
+    redo = ""
+    if previous or feedback:
+        redo = f"""
+ЭТО ПЕРЕДЕЛКА. Прошлую версию Давид забраковал.
+Его замечание: {feedback or "не понравилось, сделай сильнее"}
+Прошлый текст (не повторяй ни структуру, ни первую строку, ни формулировки):
+---
+{previous[:1500] or "нет"}
+---
+Переделка должна быть заметно другой и заметно лучше: конкретнее, плотнее,
+с физикой процесса, цифрами из практики и последствиями ошибок. Без воды.
+"""
     user = f"""Напиши пост для Telegram-канала компании.
 
 Рубрика: {RUBRICS.get(rubric, rubric)}
 Тема: {topic}
 {f"Что раскрыть: {brief}" if brief else ""}
-
+{redo}
 Недавно уже выходило (не повторяйся ни темой, ни первой строкой):
 {avoid_s}
 
@@ -312,29 +358,39 @@ def generate_post(rubric: str, topic: str, brief: str = "", avoid: list[str] | N
 как устроена работа вообще, а не как отчёт о выполненном проекте. Никаких
 «в этом проекте мы» и придуманных квартир — только общие формулировки.
 
-Подбери макет картинки под содержание:
-- "hero" — если в посте есть ударное число или короткое утверждение в 1-2 слова
-  («28 дней», «Ноль доплат», «5 этапов»). Тогда заполни card_hero.
-- "grid" — если пунктов ровно 4 или 6 и они равнозначны.
-- "band" — во всех остальных случаях. Это выбор по умолчанию.
+Насыщенность: читатель должен узнать то, чего не знал. Цифры, допуски, сроки,
+почему именно так, что будет, если иначе. Каждый абзац несёт факт, а не настроение.
+
+{LAYOUT_GUIDE}
+{("Эти макеты только что использовались, выбери другой: " + ", ".join(banned)) if banned else ""}
+
+Пункты для картинки пиши в формате «Заголовок — пояснение»: заголовок 2-4 слова,
+пояснение 4-9 слов с конкретикой. Например: «28 дней набора прочности — раньше
+плитка отойдёт вместе с клеем». Пояснение обязательно: без него картинка пустая.
 
 Верни строго JSON:
 {{"text": "готовый текст поста без хэштегов",
   "hashtags": ["#..."],
-  "card_title": "заголовок для картинки, 2-5 слов",
-  "card_lines": ["до 5 коротких пунктов для картинки, по 3-6 слов"],
-  "card_layout": "band | grid | hero",
+  "card_title": "заголовок для картинки, 2-6 слов",
+  "card_lines": ["4-6 пунктов «Заголовок — пояснение»"],
+  "card_layout": "hero | steps | versus | grid | split | quote | band",
   "card_hero": "ударное число или слово, только для hero, иначе пустая строка"}}"""
-    data = _json(ask(user, 1600, want_json=True))
+    data = _json(ask(user, 2000, want_json=True))
     data["hashtags"] = data.get("hashtags", [])[:8]
-    data["card_lines"] = data.get("card_lines", [])[:5]
+    data["card_lines"] = [str(x) for x in data.get("card_lines", [])][:6]
     layout = str(data.get("card_layout", "band")).strip().lower()
     hero = str(data.get("card_hero", "") or "").strip()
-    # «герой» без ударного слова разваливается — страхуемся
     if layout == "hero" and (not hero or len(hero) > 22):
+        layout = "split"
+    if layout == "versus" and len(data["card_lines"]) < 4:
         layout = "band"
-    if layout not in {"band", "grid", "hero"}:
-        layout = "band"
+    if layout not in LAYOUTS_ALL or layout in banned:
+        # модель выбрала занятый макет — берём первый свободный по порядку предпочтения
+        for cand in ("steps", "split", "grid", "quote", "band", "versus", "hero"):
+            if cand not in banned and (cand != "hero" or hero) \
+                    and (cand != "versus" or len(data["card_lines"]) >= 4):
+                layout = cand
+                break
     data["card_layout"], data["card_hero"] = layout, hero
     return data
 
@@ -377,41 +433,45 @@ def rewrite(text: str, instruction: str) -> str:
 # ---------------------------------------------------------------- разговор
 
 
-TOOLS = {"make_post", "publish", "schedule", "rewrite", "remake_video",
+TOOLS = {"make_post", "remake", "publish", "schedule", "rewrite", "remake_video",
          "drop", "show_queue", "invent", "health"}
 
-TOOLBOX = """Инструменты (можешь вызвать несколько подряд, можешь ни одного):
+TOOLBOX = """Инструменты. Можешь вызвать несколько подряд или ни одного:
 
 make_post — собрать пост из файлов, которые он прислал.
-    format: "photos" — пост фотографиями, без монтажа;
-            "reel" — вертикальный ролик с титрами;
-            "auto" — решай сам: есть видео или больше трёх фото → ролик, иначе фото.
-    note: детали объекта его словами (город, помещение, стадия, что делали).
-    keep_order: true, если он просил не менять порядок кадров.
-publish — опубликовать готовый пост в канал. post_id.
-schedule — поставить пост в расписание. post_id.
-rewrite — переписать текст готового поста. post_id, how (что именно поменять).
+    format: "photos" — фотографиями, без монтажа; "reel" — вертикальный ролик;
+            "auto" — есть видео или больше трёх фото → ролик, иначе фото.
+    note: детали объекта его словами. keep_order: true, если просил не менять порядок.
+remake — ПЕРЕДЕЛАТЬ готовый пост целиком по замечаниям: заново и текст, и картинка
+    (другой макет). post_id, feedback — что именно не так, его словами, полностью.
+    Это для «так себе», «криво», «мало деталей», «картинка не нравится», «сделай
+    насыщеннее», «другой визуал».
+rewrite — поправить ТОЛЬКО текст, картинка остаётся. post_id, how.
+    Это для «сократи», «убери про гарантию», «замени слово», «добавь абзац про X».
 remake_video — перемонтировать ролик у готового поста. post_id.
+publish — опубликовать пост в канал. post_id.
+schedule — поставить пост в расписание. post_id.
 drop — убрать пост. post_id.
 show_queue — показать, что в работе.
-invent — придумать пост самому, без его материала. topic (можно пустым).
+invent — придумать новый пост на тему. topic (можно пустым — выберу из банка).
 health — проверить, всё ли работает."""
 
 
 def decide(text: str, ctx: dict) -> dict:
     """Решает, что делать с сообщением Давида, и что ему ответить.
 
-    Не классификатор на девять кнопок, а список действий с параметрами: одна
-    фраза может значить «собери пост фотками, без ролика, и опубликуй».
+    Не классификатор на кнопки, а список действий с параметрами. Перед ответом
+    модель думает (think), иначе читает фразы поверхностно.
     """
     posts = ctx.get("posts") or []
     plist = "\n".join(f"- #{p['id']}: {p['status']}, {p['head']}" for p in posts) or "нет"
-    hist = "\n".join(f"{h['who']}: {h['text']}" for h in (ctx.get("history") or [])[-14:]) \
+    hist = "\n".join(f"{h['who']}: {h['text']}" for h in (ctx.get("history") or [])[-16:]) \
         or "это первое сообщение"
     files = ctx.get("media") or {"photos": 0, "videos": 0}
-    user = f"""Ты — помощник Давида. Он ведёт Telegram-канал строительной компании,
-ты собираешь ему посты. Он пишет обычными словами, без команд, и ждёт,
-что ты поймёшь с первого раза и не будешь переспрашивать очевидное.
+    last = ctx.get("last_post") or {}
+    user = f"""Ты — помощник Давида, SMM-редактор строительной компании. Он ведёт
+Telegram-канал, ты собираешь ему посты и отвечаешь за визуал. Он пишет обычными
+словами, как коллеге, и ждёт, что ты поймёшь с первого раза.
 
 Переписка (старые сообщения сверху):
 {hist}
@@ -424,34 +484,46 @@ def decide(text: str, ctx: dict) -> dict:
 Положение дел:
 - Не разобранных файлов от него: фото {files.get('photos', 0)}, видео {files.get('videos', 0)}
 - Что уже известно про этот материал: {ctx.get('note') or 'ничего'}
+- Последний пост, который ты ему показывал: {("#" + str(last.get("id")) + " — " + str(last.get("head", ""))) if last else "нет"}
 - Посты в работе:
 {plist}
 
 {TOOLBOX}
 
 Как думать:
-1. Разбери фразу целиком, до конца. В ней может быть сразу и задание, и условие,
-   и уточнение: «сделай пост, видео не надо, фото по порядку» — это один вызов
-   make_post с format="photos" и keep_order=true, а не повод переспрашивать.
-2. Отрицание — это условие, а не отдельная просьба. «не нужно монтировать видео»
-   означает format="photos". Никогда не читай отрицание как просьбу что-то удалить.
-3. drop вызывай, только если он явно просит убрать существующий пост и понятно
-   какой. Сомневаешься — не вызывай ничего и спроси в ответе.
+1. Прочитай фразу целиком. В ней может быть задание, условие и уточнение сразу:
+   «сделай пост, видео не надо, фото по порядку» — один make_post с format="photos"
+   и keep_order=true. Отрицание — это условие, а не просьба что-то удалить.
+2. Если он ругает пост или картинку — это remake того поста. «Так себе», «криво»,
+   «мало деталей», «картинка не нравится», «насыщеннее» — всё remake, с его словами
+   в feedback. Не переспрашивай, что именно не так, если он уже сказал хоть что-то:
+   сделай и покажи, он поправит.
+3. Пост без номера — это последний показанный (см. выше), либо тот, о котором шла
+   речь в переписке. Переспрашивай номер, только если постов несколько и по
+   переписке правда не понять.
 4. Если он уже просил собрать пост — раньше в переписке или подписью к фото, —
    договорённость в силе. Разрешения второй раз не спрашивают.
-5. Если файлов нет, а он просит собрать — не вызывай инструмент, скажи,
-   что ждёшь материал.
-6. Не переспрашивай то, что уже прозвучало в переписке.
-7. Если ничего делать не надо — верни пустой список действий и просто ответь.
+5. drop — только если он явно просит убрать существующий пост.
+6. Если файлов нет, а он просит собрать — не вызывай инструмент, скажи, что ждёшь материал.
+7. Обещай ТОЛЬКО то, что делаешь инструментом в этом же ответе. Нет инструмента —
+   так и скажи. Фраза «подберу нормальный визуал» без remake — ложь, так нельзя.
+8. Если он задал вопрос или просит совета — ответь по существу, как знающий человек,
+   без инструментов. Разговаривать ты тоже умеешь.
+9. Ничего делать не надо — верни пустой список действий и просто ответь.
 
-Ответ Давиду (поле reply): живым языком, на «ты», одна-две строки. Без списков,
-без markdown, без канцелярита, без упоминания команд. Если берёшь материал
-в работу — назови, что именно взял и в каком виде соберёшь.
+Ответ Давиду (reply): живым языком, на «ты». Коротко, когда дело в действии:
+скажи, что берёшь и как сделаешь. Развёрнуто, когда он спрашивает или обсуждает.
+Без списков, без markdown, без канцелярита, без упоминания команд.
 
 Верни строго JSON:
 {{"reply": "что написать Давиду",
   "actions": [{{"tool": "имя инструмента", "args": {{"...": "..."}}}}]}}"""
-    data = _json(ask(user, 900, want_json=True))
+    try:
+        data = _json(ask(user, 1000, want_json=True, think=1024))
+    except LLMError as e:
+        # если размышление модели недоступно — отвечаем без него, но отвечаем
+        log.warning("decide с размышлением не вышел (%s), пробую без", str(e)[:120])
+        data = _json(ask(user, 1000, want_json=True))
     actions = []
     for a in (data.get("actions") or [])[:4]:
         if not isinstance(a, dict):
