@@ -182,7 +182,8 @@ def _parts(user: str, images: list | None) -> list[dict]:
 
 
 # коды, при которых имеет смысл подождать и повторить
-LAYOUTS_ALL = {"band", "grid", "hero", "split", "quote", "steps", "versus"}
+LAYOUTS_ALL = {"band", "grid", "hero", "split", "quote", "steps", "versus", "numbers",
+               "checklist", "stats", "poster", "faq", "myth", "table", "warning", "columns"}
 
 RETRY_CODES = ("HTTP 429", "HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504", "сеть")
 
@@ -312,20 +313,32 @@ def caption_for_object(*, guess: str, note: str, photos: int, videos: int,
     return data
 
 
-LAYOUT_GUIDE = """Макеты картинки (все в одном фирменном стиле, но выглядят по-разному):
-- "hero"   — есть ударное число или 1-2 слова («28 дней», «Ноль доплат»). Заполни card_hero.
-- "steps"  — процесс по порядку: этапы, последовательность, «сначала — потом». 4-6 пунктов.
-- "versus" — ошибки против правильного: пункты идут ПАРАМИ, нечётный — «так нельзя»,
-             чётный — «так правильно». 4 или 6 пунктов.
-- "grid"   — 4 или 6 равнозначных пунктов без порядка: критерии, признаки, что входит.
-- "split"  — короткий заголовок в 2-4 слова и 3-5 пунктов с пояснениями.
-- "quote"  — одна сильная мысль, которую хочется прочитать целиком; 1-3 пояснения.
-- "band"   — универсальный: заголовок и 3-5 пунктов."""
+LAYOUT_GUIDE = """Макеты картинки — все в одном фирменном стиле, но выглядят по-разному.
+Каждый бывает светлым (белый лист) и тёмным (чёрный лист) — поле card_theme.
+
+- "hero"      ударное число или 1-2 слова («28 дней», «Ноль доплат»). Заполни card_hero.
+- "stats"     2-4 больших числа с подписью: пункты вида «28 дней — набирает прочность стяжка».
+- "steps"     процесс по порядку: этапы, «сначала — потом». 4-6 пунктов.
+- "numbers"   редакционный список с огромными номерами 01, 02… 3-5 пунктов.
+- "checklist" что проверить / что должно быть: чекбоксы с галочками. 4-6 пунктов.
+- "versus"    ошибка против правильного, пункты ПАРАМИ: нечётный «так нельзя»,
+              чётный «так правильно». 4 или 6 пунктов.
+- "myth"      миф против реальности, пункты ПАРАМИ: нечётный — миф (короткий),
+              чётный — как на самом деле (с пояснением). 4 или 6 пунктов.
+- "warning"   ошибки, за которые дорого платят: косая штриховка сверху. 3-5 пунктов.
+- "faq"       вопрос-ответ, пункты вида «Вопрос? — Ответ». 2-4 пары.
+- "table"     параметр — значение: «Влажность перед плиткой — 4%». 4-7 строк.
+- "grid"      4 или 6 равнозначных пунктов: критерии, признаки, что входит.
+- "columns"   инверсный верх с заголовком, ниже пункты в две колонки. 4-6 пунктов.
+- "split"     чёрная колонка с коротким заголовком, справа 3-5 пунктов.
+- "quote"     одна сильная мысль крупно; 1-3 пояснения.
+- "poster"    афиша: 1-3 слова огромно, внизу 1-2 строки подписи. Только тёмная тема.
+- "band"      универсальный: заголовок и 3-5 пунктов."""
 
 
 def generate_post(rubric: str, topic: str, brief: str = "", avoid: list[str] | None = None,
                   feedback: str = "", previous: str = "",
-                  avoid_layouts: list[str] | None = None) -> dict:
+                  avoid_layouts: list[str] | None = None, theme: str = "") -> dict:
     """Пишет автопост и описывает картинку к нему.
 
     feedback/previous — когда Давид забраковал прошлую версию: что не так и что было.
@@ -367,31 +380,40 @@ def generate_post(rubric: str, topic: str, brief: str = "", avoid: list[str] | N
 Пункты для картинки пиши в формате «Заголовок — пояснение»: заголовок 2-4 слова,
 пояснение 4-9 слов с конкретикой. Например: «28 дней набора прочности — раньше
 плитка отойдёт вместе с клеем». Пояснение обязательно: без него картинка пустая.
+Для stats и table заголовок пункта — это число или значение, пояснение — что оно значит.
+{("Тема картинки на этот раз: " + theme + ".") if theme else "Тему (light/dark) выбери сам, под настроение поста."}
 
 Верни строго JSON:
 {{"text": "готовый текст поста без хэштегов",
   "hashtags": ["#..."],
   "card_title": "заголовок для картинки, 2-6 слов",
   "card_lines": ["4-6 пунктов «Заголовок — пояснение»"],
-  "card_layout": "hero | steps | versus | grid | split | quote | band",
+  "card_layout": "одно из названий макетов",
+  "card_theme": "light | dark",
   "card_hero": "ударное число или слово, только для hero, иначе пустая строка"}}"""
     data = _json(ask(user, 2000, want_json=True))
     data["hashtags"] = data.get("hashtags", [])[:8]
     data["card_lines"] = [str(x) for x in data.get("card_lines", [])][:6]
     layout = str(data.get("card_layout", "band")).strip().lower()
     hero = str(data.get("card_hero", "") or "").strip()
+    n = len(data["card_lines"])
     if layout == "hero" and (not hero or len(hero) > 22):
         layout = "split"
-    if layout == "versus" and len(data["card_lines"]) < 4:
+    if layout in ("versus", "myth") and n < 4:
         layout = "band"
     if layout not in LAYOUTS_ALL or layout in banned:
         # модель выбрала занятый макет — берём первый свободный по порядку предпочтения
-        for cand in ("steps", "split", "grid", "quote", "band", "versus", "hero"):
+        for cand in ("steps", "numbers", "checklist", "split", "columns", "grid", "table",
+                     "quote", "warning", "stats", "band", "faq", "versus", "myth", "hero"):
             if cand not in banned and (cand != "hero" or hero) \
-                    and (cand != "versus" or len(data["card_lines"]) >= 4):
+                    and (cand not in ("versus", "myth") or n >= 4):
                 layout = cand
                 break
+    th = str(data.get("card_theme") or theme or "light").strip().lower()
+    if layout == "poster":
+        th = "dark"
     data["card_layout"], data["card_hero"] = layout, hero
+    data["card_theme"] = th if th in ("light", "dark") else "light"
     return data
 
 
@@ -428,6 +450,133 @@ def rewrite(text: str, instruction: str) -> str:
 
 Верни только новый текст поста: без пояснений, без хэштегов, без кавычек вокруг."""
     return ask(user, 1400)
+
+
+# ---------------------------------------------------------------- осмотр и чистка кадров
+
+
+def inspect_photos(images: list, note: str = "") -> dict:
+    """Смотрит на присланные кадры до того, как писать текст.
+
+    Возвращает, что на каждом кадре лишнее (наложенный текст, логотипы, даты,
+    элементы интерфейса) и какие кадры образуют пары «до / после».
+    """
+    if not images:
+        return {"photos": [], "pairs": []}
+    user = f"""Перед тобой {len(images)} кадр(ов) с объекта, в том порядке, в каком приложены
+(нумерация с 0). Комментарий Давида: {note or "нет"}.
+
+Задача 1. На каждом кадре найди ЛИШНЕЕ, чего в чистой фотографии интерьера быть
+не должно: наложенный текст и подписи, водяные знаки, логотипы, дата и время
+съёмки, стикеры, эмодзи, элементы интерфейса приложений, рамки, чужие
+надписи. Настоящие объекты — вывески, упаковки, инструмент — лишним не считаются.
+Для каждого кадра верни clutter: true/false, коротко what — что именно, и where —
+где оно расположено: top, bottom, left, right или center.
+
+Задача 2. Определи, есть ли пары «до / после»: один и тот же ракурс или
+помещение до ремонта (черновая, старая отделка, демонтаж) и после (чистовая).
+Если пары есть — верни их индексы. Если не уверен — пар нет.
+
+Задача 3. Для каждого кадра одним словом — что на нём: кухня, ванная, коридор,
+спальня, черновая, фасад и т.п.
+
+Верни строго JSON:
+{{"photos": [{{"i": 0, "clutter": false, "what": "", "where": "", "room": "кухня"}}, ...],
+  "pairs": [{{"before": 0, "after": 1}}]}}"""
+    data = _json(ask(user, 900, want_json=True, images=images))
+    photos = []
+    for x in data.get("photos") or []:
+        try:
+            i = int(x.get("i"))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= i < len(images):
+            photos.append({"i": i, "clutter": bool(x.get("clutter")),
+                           "what": str(x.get("what") or "")[:120],
+                           "where": str(x.get("where") or "")[:10].lower(),
+                           "room": str(x.get("room") or "")[:40]})
+    pairs = []
+    for pr in data.get("pairs") or []:
+        try:
+            bi, ai = int(pr.get("before")), int(pr.get("after"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if bi != ai and 0 <= bi < len(images) and 0 <= ai < len(images):
+            pairs.append({"before": bi, "after": ai})
+    return {"photos": photos, "pairs": pairs[:3]}
+
+
+IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "").strip()
+
+
+def _image_chain() -> list[str]:
+    chain = [IMAGE_MODEL, "gemini-2.5-flash-image", "gemini-2.5-flash-image-preview"]
+    out, seen = [], set()
+    for m in chain:
+        if m and m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
+
+
+def clean_photo(src, dst, what: str = "") -> bool:
+    """Убирает с фотографии наложенный текст и прочий мусор картиночной моделью.
+
+    Возвращает True, если dst записан. Модель просят ничего, кроме лишнего,
+    не трогать: ни цвет, ни кадрирование, ни предметы.
+    """
+    if not GEMINI_KEY or provider() != "gemini":
+        return False
+    prompt = ("Убери с этой фотографии всё наложенное поверх снимка: текст, подписи, "
+              "водяные знаки, логотипы, дату и время, стикеры, элементы интерфейса"
+              + (f" — в частности: {what}" if what else "") +
+              ". Аккуратно дорисуй фон на их месте. Всё остальное оставь ровно как есть: "
+              "тот же кадр, те же цвета, та же резкость, ничего не добавляй и не улучшай. "
+              "Верни только изображение.")
+    problems = []
+    for model in _image_chain():
+        try:
+            r = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                headers={"x-goog-api-key": GEMINI_KEY, "content-type": "application/json"},
+                json={"contents": [{"role": "user", "parts": [
+                          {"inline_data": {"mime_type": "image/jpeg", "data": shrink(src, 1280, 90)}},
+                          {"text": prompt}]}],
+                      "generationConfig": {"responseModalities": ["IMAGE"]}},
+                timeout=180,
+            )
+        except requests.RequestException as e:
+            problems.append(f"{model}: сеть — {e}")
+            continue
+        if r.status_code != 200:
+            problems.append(f"{model}: HTTP {r.status_code} {r.text[:120]}")
+            continue
+        parts = ((r.json().get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+        for part in parts:
+            blob = part.get("inlineData") or part.get("inline_data")
+            if blob and blob.get("data"):
+                from pathlib import Path as _P
+                _P(dst).write_bytes(base64.b64decode(blob["data"]))
+                log.info("кадр очищен моделью %s", model)
+                return True
+        problems.append(f"{model}: в ответе нет картинки")
+    log.warning("чистка не удалась: %s", "; ".join(problems[-2:]))
+    return False
+
+
+def crop_edge(src, dst, where: str, share: float = 0.14) -> bool:
+    """Запасной путь, когда картиночная модель недоступна: если мусор у края —
+    просто отрезаем этот край. Центр так не спасти — тогда оставляем как есть."""
+    from PIL import Image, ImageOps
+    if where not in ("top", "bottom", "left", "right"):
+        return False
+    im = ImageOps.exif_transpose(Image.open(src)).convert("RGB")
+    w, h = im.size
+    cut = int((h if where in ("top", "bottom") else w) * share)
+    box = {"top": (0, cut, w, h), "bottom": (0, 0, w, h - cut),
+           "left": (cut, 0, w, h), "right": (0, 0, w - cut, h)}[where]
+    im.crop(box).save(dst, "JPEG", quality=92)
+    return True
 
 
 # ---------------------------------------------------------------- разговор
