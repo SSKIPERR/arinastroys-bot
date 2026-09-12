@@ -433,6 +433,8 @@ def handle_callback(cb: dict, st: dict) -> None:
         return
 
     p = st_mod.post(st, pid)
+    log.info("кнопка «%s» на посте #%s (%s)", action, pid,
+             p.get("status") if p else "поста нет в состоянии")
     if not p:
         tg.answer_callback(cb["id"], "Пост уже не найден", alert=True)
         return
@@ -443,6 +445,7 @@ def handle_callback(cb: dict, st: dict) -> None:
             mid = publish(p)
             p["status"] = "published"
             p["message_id"] = mid
+            log.info("пост #%s опубликован, сообщение %s в канале", pid, mid)
             tg.edit_markup(chat, msg["message_id"], None)
             tg.send_message(chat, f"Опубликовал. {tg.channel_link(mid)}".strip())
         except Exception as e:  # noqa: BLE001
