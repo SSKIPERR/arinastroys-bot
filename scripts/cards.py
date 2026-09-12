@@ -1008,6 +1008,127 @@ def before_after(dst: Path, before, after, title: str = "", style: str = "side",
 BA_STYLES = ("side", "stack", "diag")
 
 
+# ---------------------------------------------------------------- разбор коллажей
+
+
+def _profile(im: Image.Image, axis: str) -> list[float]:
+    """Насколько «однотонна» каждая колонка (axis=x) или строка (axis=y).
+    Низкое число — ровная полоса, рамка или разделитель."""
+    g = im.convert("L")
+    if axis == "x":
+        g = g.transpose(Image.Transpose.ROTATE_90)   # колонки становятся строками
+    w, h = g.size
+    small = g.resize((max(w // 4, 8), h), Image.BILINEAR)
+    px = small.load()
+    out = []
+    for y in range(h):
+        row = [px[x, y] for x in range(small.width)]
+        mean = sum(row) / len(row)
+        out.append(sum(abs(v - mean) for v in row) / len(row))
+    return out
+
+
+def _edge_color(im: Image.Image, corner: str) -> tuple:
+    """Цвет рамки берём из угла — так мы режем именно рамку, а не светлую стену."""
+    w, h = im.size
+    x = 2 if corner in ("tl", "bl") else w - 3
+    y = 2 if corner in ("tl", "tr") else h - 3
+    return im.convert("RGB").getpixel((x, y))
+
+
+def _trim_to(im: Image.Image, colour: tuple, tol: int, max_frac: float) -> Image.Image:
+    """Срезает по краям всё, что совпадает с colour. Не больше max_frac с каждой стороны."""
+    from PIL import ImageChops
+    rgb = im.convert("RGB")
+    diff = ImageChops.difference(rgb, Image.new("RGB", rgb.size, colour))
+    mask = diff.convert("L").point(lambda v: 255 if v > tol else 0)
+    box = mask.getbbox()
+    if not box:
+        return im
+    w, h = im.size
+    lim_x, lim_y = int(w * max_frac), int(h * max_frac)
+    left = min(box[0], lim_x)
+    top = min(box[1], lim_y)
+    right = max(box[2], w - lim_x)
+    bottom = max(box[3], h - lim_y)
+    if right - left < w * 0.5 or bottom - top < h * 0.5:
+        return im
+    return im.crop((left, top, right, bottom))
+
+
+def autocrop_borders(im: Image.Image, tol: int = 14, max_frac: float = 0.14) -> Image.Image:
+    """Убирает однотонные рамки и плашки по краям: белые поля, чёрные полосы.
+
+    Цвет рамки определяем по углам, поэтому светлая стена внутри кадра остаётся
+    на месте — режется только то, что действительно совпадает с краем.
+    """
+    seen = set()
+    for corner in ("tl", "br", "tr", "bl"):
+        colour = _edge_color(im, corner)
+        if colour in seen:
+            continue
+        seen.add(colour)
+        im = _trim_to(im, colour, tol, max_frac)
+    return im
+
+
+def find_divider(im: Image.Image, axis: str, approx: float, tol: float = 7.0,
+                 window: float = 0.10) -> tuple[int, int] | None:
+    """Ищет однотонную полосу-разделитель около approx (доля 0..1). Возвращает (от, до)."""
+    prof = _profile(im, axis)
+    n = len(prof)
+    c = int(n * approx)
+    lo, hi = max(0, int(c - n * window)), min(n, int(c + n * window))
+    best = None
+    i = lo
+    while i < hi:
+        if prof[i] <= tol:
+            j = i
+            while j < hi and prof[j] <= tol:
+                j += 1
+            if best is None or (j - i) > (best[1] - best[0]):
+                best = (i, j)
+            i = j
+        else:
+            i += 1
+    if best and best[1] - best[0] >= 2:
+        return best
+    return None
+
+
+def split_collage(src, out_a, out_b, axis: str = "vertical", at: float = 0.5,
+                  left_is_before: bool = True) -> tuple[Path, Path] | None:
+    """Режет коллаж «до/после» на две чистые половины.
+
+    axis — по какой оси склеены половины: vertical — рядом (делим по x),
+    horizontal — стопкой (делим по y). Разделитель ищем около at; если не нашли —
+    режем ровно по at. С каждой половины срезаем рамки и остатки полосы.
+    """
+    im = autocrop_borders(_load(src))      # внешние рамки и плашки долой до разреза
+    w, h = im.size
+    ax = "x" if axis == "vertical" else "y"
+    n = w if ax == "x" else h
+    band = find_divider(im, ax, at)
+    if band:
+        a_end, b_start = band[0], band[1]
+    else:
+        a_end = b_start = int(n * at)
+    if a_end < n * 0.2 or b_start > n * 0.8:
+        return None
+    if ax == "x":
+        a, b = im.crop((0, 0, a_end, h)), im.crop((b_start, 0, w, h))
+    else:
+        a, b = im.crop((0, 0, w, a_end)), im.crop((0, b_start, w, h))
+    a, b = autocrop_borders(a), autocrop_borders(b)
+    if not left_is_before:
+        a, b = b, a
+    out_a, out_b = Path(out_a), Path(out_b)
+    out_a.parent.mkdir(parents=True, exist_ok=True)
+    a.save(out_a, "JPEG", quality=93)
+    b.save(out_b, "JPEG", quality=93)
+    return out_a, out_b
+
+
 LAYOUTS = {"band": card_band, "grid": card_grid, "hero": card_hero,
            "split": card_split, "quote": card_quote, "steps": card_steps,
            "versus": card_versus, "numbers": card_numbers, "checklist": card_checklist,
