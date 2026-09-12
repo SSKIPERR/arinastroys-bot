@@ -63,19 +63,42 @@ jobs:
 
       - name: Сохранить состояние
         if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}
         run: |
-          echo '--- что изменилось ---'
-          git status --porcelain state/ || true
-          echo '--- содержимое ---'
-          head -c 600 state/session.json; echo
           git config user.name "arinastroys-bot"
           git config user.email "bot@users.noreply.github.com"
           git add state/session.json
           if git diff --quiet --cached; then
             echo 'состояние не менялось, коммит не нужен'
-          else
-            git commit -m "state: обновление"
-            git pull --rebase
-            git push
-            echo 'состояние сохранено'
+            exit 0
           fi
+          git commit -m "state: обновление"
+          # Пока прогон работал, в ветку могли положить коммит (например, правку кода).
+          # Тогда push отбивают. Состояние всегда берём НАШЕ: этот заход уже разобрал
+          # почту, и откат затёр бы offset и статусы постов — работа пропала бы молча.
+          for try in 1 2 3 4 5; do
+            if git push origin HEAD:main; then
+              echo "состояние сохранено с попытки $try"
+              exit 0
+            fi
+            echo "push отбили (попытка $try), кладу своё состояние поверх свежей ветки"
+            git fetch origin main
+            cp state/session.json /tmp/session.json
+            git reset --hard origin/main
+            cp /tmp/session.json state/session.json
+            git add state/session.json
+            if git diff --quiet --cached; then
+              echo 'в ветке уже лежит наше состояние'
+              exit 0
+            fi
+            git commit -m "state: обновление"
+            sleep 2
+          done
+          echo 'состояние сохранить не удалось'
+          curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+            -d chat_id="$OWNER_ID" \
+            --data-urlencode text="Не смог сохранить состояние: последнее действие пропало, повтори его." \
+            >/dev/null || true
+          exit 1
