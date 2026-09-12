@@ -108,11 +108,27 @@ def shrink(path, side: int = 768, quality: int = 78) -> str:
 
 
 def ask(user: str, max_tokens: int = 1600, want_json: bool = False,
-        images: list | None = None, think: int = 0) -> str:
+        images: list | None = None, think: int = 0, pro: bool = False) -> str:
     """think — бюджет токенов на размышление до ответа. Ноль — отвечать сразу.
-    Для разбора фраз Давида включаем: модель заметно точнее читает контекст."""
-    return _ask_gemini(user, max_tokens, want_json, images, think) if provider() == "gemini" \
-        else _ask_anthropic(user, max_tokens, images)
+    pro — начинать с самой сильной модели: решения, осмотр кадров и тексты постов
+    заметно лучше, а если pro недоступна, цепочка сама съедет на flash."""
+    if provider() != "gemini":
+        return _ask_anthropic(user, max_tokens, images)
+    return _ask_gemini(user, max_tokens, want_json, images, think,
+                       _pro_chain() if pro else None)
+
+
+PRO_MODEL = os.environ.get("GEMINI_PRO_MODEL", "").strip()
+
+
+def _pro_chain() -> list[str]:
+    """Сначала самые умные модели, следом обычная цепочка — как запасной аэродром."""
+    out, seen = [], set()
+    for m in [PRO_MODEL, "gemini-3-pro", "gemini-2.5-pro", *_gemini_chain()]:
+        if m and m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
 
 
 def _gemini_chain() -> list[str]:
@@ -189,12 +205,13 @@ RETRY_CODES = ("HTTP 429", "HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504", "се
 
 
 def _ask_gemini(user: str, max_tokens: int, want_json: bool = False,
-                images: list | None = None, think: int = 0) -> str:
+                images: list | None = None, think: int = 0,
+                models: list[str] | None = None) -> str:
     if not GEMINI_KEY:
         raise LLMError("не задан GEMINI_API_KEY")
 
     problems: list[str] = []
-    for model in _gemini_chain():
+    for model in (models or _gemini_chain()):
         for attempt in range(3):
             text, why = _gemini_once(model, user, max_tokens, want_json, images, think)
             if text:
@@ -306,7 +323,7 @@ def caption_for_object(*, guess: str, note: str, photos: int, videos: int,
   "video_title": "2-4 слова для титра на видео",
   "video_subtitle": "город или тип объекта, до 30 знаков, можно пустую строку",
   "seen": "одной строкой: что ты разглядел на кадрах"}}"""
-    data = _json(ask(user, 1300, want_json=True, images=images))
+    data = _json(ask(user, 1300, want_json=True, images=images, think=512, pro=True))
     data["hashtags"] = data.get("hashtags", [])[:8]
     if data.get("seen"):
         log.info("на кадрах: %s", str(data["seen"])[:200])
@@ -394,7 +411,7 @@ def generate_post(rubric: str, topic: str, brief: str = "", avoid: list[str] | N
   "card_layout": "одно из названий макетов",
   "card_theme": "light | dark",
   "card_hero": "ударное число или слово, только для hero, иначе пустая строка"}}"""
-    data = _json(ask(user, 2000, want_json=True))
+    data = _json(ask(user, 2000, want_json=True, think=768, pro=True))
     data["hashtags"] = data.get("hashtags", [])[:8]
     data["card_lines"] = [str(x) for x in data.get("card_lines", [])][:6]
     layout = str(data.get("card_layout", "band")).strip().lower()
@@ -466,45 +483,76 @@ def rewrite(text: str, instruction: str) -> str:
 
 
 def inspect_photos(images: list, note: str = "") -> dict:
-    """Смотрит на присланные кадры до того, как писать текст.
+    """Осматривает кадры до того, как писать текст.
 
-    Возвращает, что на каждом кадре лишнее (наложенный текст, логотипы, даты,
-    элементы интерфейса) и какие кадры образуют пары «до / после».
+    Отвечает на три вопроса сразу: что на кадре лишнее, не склеен ли кадр
+    из двух половин «до/после», и к какому объекту он относится. Группировка
+    по объектам нужна, чтобы из одной пачки вышло столько постов, сколько
+    прислали квартир, а не один общий.
     """
     if not images:
-        return {"photos": [], "pairs": []}
-    user = f"""Перед тобой {len(images)} кадр(ов) с объекта, в том порядке, в каком приложены
-(нумерация с 0). Комментарий Давида: {note or "нет"}.
+        return {"photos": []}
+    user = f"""Перед тобой {len(images)} кадр(ов) с объектов, по порядку (нумерация с 0).
+Комментарий Давида: {note or "нет"}.
 
-Задача 1. На каждом кадре найди ЛИШНЕЕ, чего в чистой фотографии интерьера быть
-не должно: наложенный текст и подписи, водяные знаки, логотипы, дата и время
-съёмки, стикеры, эмодзи, элементы интерфейса приложений, рамки, чужие
-надписи. Настоящие объекты — вывески, упаковки, инструмент — лишним не считаются.
-Для каждого кадра верни clutter: true/false, коротко what — что именно, и where —
-где оно расположено: top, bottom, left, right или center.
+Разбери каждый кадр по четырём вопросам.
 
-Задача 2. Определи, есть ли пары «до / после»: один и тот же ракурс или
-помещение до ремонта (черновая, старая отделка, демонтаж) и после (чистовая).
-Если пары есть — верни их индексы. Если не уверен — пар нет.
+1. ЛИШНЕЕ. Что на кадре наложено поверх съёмки и не должно попасть в пост:
+   текст и подписи, водяные знаки, логотипы, дата и время, стикеры, эмодзи,
+   элементы интерфейса, рамки-плашки. Реальные предметы в кадре — вывески,
+   упаковки, инструмент — лишним НЕ считаются.
+   Верни clutter (true/false), what (что именно), where (top/bottom/left/right/center).
 
-Задача 3. Для каждого кадра одним словом — что на нём: кухня, ванная, коридор,
-спальня, черновая, фасад и т.п.
+2. КОЛЛАЖ. Не склеен ли кадр из двух фотографий — «до» и «после» рядом или одна
+   над другой, часто с полосой или рамкой между ними? Это очень частый случай.
+   Верни collage (true/false), axis ("vertical" — половины рядом слева и справа,
+   "horizontal" — одна над другой), at (доля 0..1, где проходит стык, обычно 0.5),
+   before_side ("first" — «до» слева или сверху, "second" — наоборот).
+   Отличай коллаж от обычного фото: в коллаже две РАЗНЫЕ сцены или одна сцена
+   в двух состояниях, разделённые чёткой границей.
+
+3. ОБЪЕКТ. К какой квартире или объекту относится кадр. Дай объекту короткое
+   имя своими словами: «кухня-гостиная», «санузел», «фасад дачи». Кадры одной
+   и той же квартиры должны получить ОДНО И ТО ЖЕ имя. Разные квартиры — разные
+   имена. Если объект один — у всех кадров одно имя.
+
+4. ЧТО НА КАДРЕ. room — помещение одним словом; stage — стадия:
+   "черновая", "в процессе", "чистовая".
+
+Если среди кадров есть отдельные (не склеенные) фотографии одного места до
+и после ремонта — укажи их парами в pairs.
 
 Верни строго JSON:
-{{"photos": [{{"i": 0, "clutter": false, "what": "", "where": "", "room": "кухня"}}, ...],
+{{"photos": [{{"i": 0, "clutter": false, "what": "", "where": "",
+              "collage": false, "axis": "vertical", "at": 0.5, "before_side": "first",
+              "object": "кухня-гостиная", "room": "кухня", "stage": "чистовая"}}],
   "pairs": [{{"before": 0, "after": 1}}]}}"""
-    data = _json(ask(user, 900, want_json=True, images=images))
+    data = _json(ask(user, 1400, want_json=True, images=images, think=768, pro=True))
     photos = []
     for x in data.get("photos") or []:
         try:
             i = int(x.get("i"))
         except (TypeError, ValueError):
             continue
-        if 0 <= i < len(images):
-            photos.append({"i": i, "clutter": bool(x.get("clutter")),
-                           "what": str(x.get("what") or "")[:120],
-                           "where": str(x.get("where") or "")[:10].lower(),
-                           "room": str(x.get("room") or "")[:40]})
+        if not 0 <= i < len(images):
+            continue
+        try:
+            at = float(x.get("at") or 0.5)
+        except (TypeError, ValueError):
+            at = 0.5
+        photos.append({
+            "i": i,
+            "clutter": bool(x.get("clutter")),
+            "what": str(x.get("what") or "")[:120],
+            "where": str(x.get("where") or "")[:10].lower(),
+            "collage": bool(x.get("collage")),
+            "axis": "horizontal" if str(x.get("axis", "")).startswith("horiz") else "vertical",
+            "at": at if 0.2 <= at <= 0.8 else 0.5,
+            "before_first": str(x.get("before_side") or "first").lower() != "second",
+            "object": str(x.get("object") or "")[:60],
+            "room": str(x.get("room") or "")[:40],
+            "stage": str(x.get("stage") or "")[:40],
+        })
     pairs = []
     for pr in data.get("pairs") or []:
         try:
@@ -513,7 +561,7 @@ def inspect_photos(images: list, note: str = "") -> dict:
             continue
         if bi != ai and 0 <= bi < len(images) and 0 <= ai < len(images):
             pairs.append({"before": bi, "after": ai})
-    return {"photos": photos, "pairs": pairs[:3]}
+    return {"photos": photos, "pairs": pairs[:4]}
 
 
 IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "").strip()
@@ -592,8 +640,8 @@ def crop_edge(src, dst, where: str, share: float = 0.14) -> bool:
 # ---------------------------------------------------------------- разговор
 
 
-TOOLS = {"make_post", "remake", "publish", "schedule", "rewrite", "remake_video",
-         "drop", "show_queue", "invent", "health"}
+TOOLS = {"make_post", "remake", "split_post", "publish", "schedule", "rewrite",
+         "remake_video", "drop", "show_queue", "invent", "health"}
 
 TOOLBOX = """Инструменты. Можешь вызвать несколько подряд или ни одного:
 
@@ -601,10 +649,13 @@ make_post — собрать пост из файлов, которые он п�
     format: "photos" — фотографиями, без монтажа; "reel" — вертикальный ролик;
             "auto" — есть видео или больше трёх фото → ролик, иначе фото.
     note: детали объекта его словами. keep_order: true, если просил не менять порядок.
-remake — ПЕРЕДЕЛАТЬ готовый пост целиком по замечаниям: заново и текст, и картинка
-    (другой макет). post_id, feedback — что именно не так, его словами, полностью.
+remake — ПЕРЕДЕЛАТЬ готовый пост целиком по замечаниям: заново и текст, и картинка.
+    post_id, feedback — что именно не так, его словами, полностью.
+    Для поста с объекта заодно заново чистит кадры и режет склейки до/после.
     Это для «так себе», «криво», «мало деталей», «картинка не нравится», «сделай
-    насыщеннее», «другой визуал».
+    насыщеннее», «другой визуал», «обработай фотографии», «убери полосы и рамки».
+split_post — РАЗБИТЬ готовый пост на несколько: по одному на каждый объект
+    на кадрах. post_id. Это для «надо два отдельных поста», «раздели по квартирам».
 rewrite — поправить ТОЛЬКО текст, картинка остаётся. post_id, how.
     Это для «сократи», «убери про гарантию», «замени слово», «добавь абзац про X».
 remake_video — перемонтировать ролик у готового поста. post_id.
@@ -653,22 +704,27 @@ Telegram-канал, ты собираешь ему посты и отвечае
 1. Прочитай фразу целиком. В ней может быть задание, условие и уточнение сразу:
    «сделай пост, видео не надо, фото по порядку» — один make_post с format="photos"
    и keep_order=true. Отрицание — это условие, а не просьба что-то удалить.
-2. Если он ругает пост или картинку — это remake того поста. «Так себе», «криво»,
+2. Если он просит СДЕЛАТЬ НЕСКОЛЬКО ПОСТОВ из уже собранного — это split_post.
+   Если он в одной фразе и просит разделить, и ругает картинки — вызывай
+   split_post: при разборе кадры всё равно чистятся заново.
+3. Если он ругает пост или картинку — это remake того поста. «Так себе», «криво»,
    «мало деталей», «картинка не нравится», «насыщеннее» — всё remake, с его словами
    в feedback. Не переспрашивай, что именно не так, если он уже сказал хоть что-то:
    сделай и покажи, он поправит.
-3. Пост без номера — это последний показанный (см. выше), либо тот, о котором шла
+4. Пост без номера — это последний показанный (см. выше), либо тот, о котором шла
    речь в переписке. Переспрашивай номер, только если постов несколько и по
    переписке правда не понять.
-4. Если он уже просил собрать пост — раньше в переписке или подписью к фото, —
+5. Если он уже просил собрать пост — раньше в переписке или подписью к фото, —
    договорённость в силе. Разрешения второй раз не спрашивают.
-5. drop — только если он явно просит убрать существующий пост.
-6. Если файлов нет, а он просит собрать — не вызывай инструмент, скажи, что ждёшь материал.
-7. Обещай ТОЛЬКО то, что делаешь инструментом в этом же ответе. Нет инструмента —
+6. drop — только если он явно просит убрать существующий пост.
+7. Если файлов нет, а он просит собрать — не вызывай инструмент, скажи, что ждёшь материал.
+8. Обещай ТОЛЬКО то, что делаешь инструментом в этом же ответе. Нет инструмента —
    так и скажи. Фраза «подберу нормальный визуал» без remake — ложь, так нельзя.
-8. Если он задал вопрос или просит совета — ответь по существу, как знающий человек,
+   Чистить кадры отдельным действием ты не умеешь: это часть make_post, remake
+   и split_post — просто вызови нужный, и кадры почистятся заодно.
+9. Если он задал вопрос или просит совета — ответь по существу, как знающий человек,
    без инструментов. Разговаривать ты тоже умеешь.
-9. Ничего делать не надо — верни пустой список действий и просто ответь.
+10. Ничего делать не надо — верни пустой список действий и просто ответь.
 
 Ответ Давиду (reply): живым языком, на «ты». Коротко, когда дело в действии:
 скажи, что берёшь и как сделаешь. Развёрнуто, когда он спрашивает или обсуждает.
@@ -678,10 +734,10 @@ Telegram-канал, ты собираешь ему посты и отвечае
 {{"reply": "что написать Давиду",
   "actions": [{{"tool": "имя инструмента", "args": {{"...": "..."}}}}]}}"""
     try:
-        data = _json(ask(user, 1000, want_json=True, think=1024))
+        data = _json(ask(user, 1200, want_json=True, think=1536, pro=True))
     except LLMError as e:
-        # если размышление модели недоступно — отвечаем без него, но отвечаем
-        log.warning("decide с размышлением не вышел (%s), пробую без", str(e)[:120])
+        # сильная модель или размышление недоступны — отвечаем попроще, но отвечаем
+        log.warning("decide на сильной модели не вышел (%s), пробую проще", str(e)[:120])
         data = _json(ask(user, 1000, want_json=True))
     actions = []
     for a in (data.get("actions") or [])[:4]:
