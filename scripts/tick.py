@@ -281,6 +281,9 @@ def run_tool(tool: str, args: dict, text: str, chat: int, st: dict) -> None:
     elif tool == "remake":
         regenerate_post(st, pid, str(args.get("feedback") or text))
 
+    elif tool == "split_post":
+        split_post(st, pid)
+
     elif tool == "remake_video":
         rebuild(st, pid)
 
@@ -529,46 +532,92 @@ def download_batch(media: list[dict], folder: Path) -> tuple[list[Path], list[Pa
     return videos, photos, problems
 
 
-def tidy_photos(photos: list[Path], folder: Path, note: str,
-                problems: list[str]) -> tuple[list[Path], list[dict], list[str]]:
-    """Осмотр кадров моделью: чистим от наложенного текста, находим пары до/после."""
+def clean_one(src: Path, dst: Path, what: str, where: str, problems: list[str],
+              tag: str) -> Path:
+    """Пробует убрать лишнее с кадра: сперва картиночной моделью, потом обрезкой."""
+    try:
+        if brand.clean_photo(src, dst, what):
+            return dst
+    except Exception as e:  # noqa: BLE001
+        log.warning("чистка %s упала: %s", tag, e)
+    try:
+        if brand.crop_edge(src, dst, where):
+            log.info("%s: обрезал край %s", tag, where)
+            return dst
+    except Exception as e:  # noqa: BLE001
+        log.warning("обрезка %s упала: %s", tag, e)
+    problems.append(f"на кадре {tag} лишнее ({what or 'текст'}), убрать не смог")
+    return src
+
+
+def prepare_shots(photos: list[Path], folder: Path, note: str,
+                  problems: list[str]) -> list[dict]:
+    """Осмотр кадров: чистка, разрез коллажей, группировка по объектам.
+
+    Возвращает список кадров вида
+    {"path", "object", "room", "stage", "role": "before"/"after"/"", "pair": метка}
+    — коллаж превращается в два кадра с общей меткой пары. Метка, а не индекс:
+    после группировки по объектам индексы разъезжаются, а метка держится.
+    """
+    plain = [{"path": p, "object": "", "room": "", "stage": "", "role": "", "pair": None}
+             for p in photos]
     try:
         info = brand.inspect_photos(photos[:8], note)
     except Exception as e:  # noqa: BLE001
         log.warning("осмотр кадров не удался: %s", e)
-        return photos, [], []
+        return plain
 
-    out = list(photos)
-    cleaned = 0
-    for ph_info in info.get("photos", []):
-        if not ph_info.get("clutter"):
+    by_i = {x["i"]: x for x in info.get("photos", [])}
+    shots: list[dict] = []
+    index_of: dict[int, int] = {}          # исходный индекс -> индекс первого кадра
+
+    for i, src in enumerate(photos):
+        meta = by_i.get(i, {})
+        obj = meta.get("object") or ""
+        base = {"object": obj, "room": meta.get("room", ""), "stage": meta.get("stage", ""),
+                "role": "", "pair": None}
+
+        if meta.get("collage"):
+            cut = cards.split_collage(
+                src, folder / f"cut{i:02d}a.jpg", folder / f"cut{i:02d}b.jpg",
+                axis=meta.get("axis", "vertical"), at=meta.get("at", 0.5),
+                left_is_before=meta.get("before_first", True))
+            if cut:
+                log.info("кадр %d — коллаж, разрезал на две половины", i + 1)
+                index_of[i] = len(shots)
+                shots.append({**base, "path": cut[0], "role": "before", "pair": f"c{i}"})
+                shots.append({**base, "path": cut[1], "role": "after", "pair": f"c{i}"})
+                continue
+            problems.append(f"кадр {i + 1} похож на склейку до/после, разрезать не вышло")
+
+        path = src
+        if meta.get("clutter"):
+            path = clean_one(src, folder / f"clean{i:02d}.jpg", meta.get("what", ""),
+                             meta.get("where", ""), problems, str(i + 1))
+        index_of[i] = len(shots)
+        shots.append({**base, "path": path})
+
+    # отдельные фото «до» и «после» одного места
+    for pr in info.get("pairs", []):
+        bi, ai = index_of.get(pr["before"]), index_of.get(pr["after"])
+        if bi is None or ai is None or bi == ai:
             continue
-        i = ph_info["i"]
-        src = out[i]
-        dst = folder / f"clean{i:02d}.jpg"
-        ok = False
-        try:
-            ok = brand.clean_photo(src, dst, ph_info.get("what", ""))
-        except Exception as e:  # noqa: BLE001
-            log.warning("чистка кадра %d упала: %s", i, e)
-        if not ok:
-            try:
-                ok = brand.crop_edge(src, dst, ph_info.get("where", ""))
-                if ok:
-                    log.info("кадр %d: обрезал край %s", i, ph_info.get("where"))
-            except Exception as e:  # noqa: BLE001
-                log.warning("обрезка кадра %d упала: %s", i, e)
-        if ok:
-            out[i] = dst
-            cleaned += 1
-        else:
-            problems.append(f"на кадре {i + 1} лишнее ({ph_info.get('what') or 'текст'}), "
-                            f"убрать не смог")
-    if cleaned:
-        log.info("очищено кадров: %d", cleaned)
-    rooms = [x["room"] for x in info.get("photos", []) if x.get("room")]
-    rooms = list(dict.fromkeys(rooms))
-    return out, info.get("pairs", []), rooms
+        if shots[bi]["role"] or shots[ai]["role"]:
+            continue
+        shots[bi].update(role="before", pair=f"d{bi}")
+        shots[ai].update(role="after", pair=f"d{bi}")
+        if shots[ai]["object"] and not shots[bi]["object"]:
+            shots[bi]["object"] = shots[ai]["object"]
+
+    return shots
+
+
+def group_shots(shots: list[dict]) -> list[list[dict]]:
+    """Делит кадры на объекты: сколько квартир прислали, столько и постов."""
+    groups: dict[str, list[dict]] = {}
+    for sh in shots:
+        groups.setdefault(sh.get("object") or "объект", []).append(sh)
+    return [g for g in groups.values() if g]
 
 
 def pick_theme(st: dict) -> str:
@@ -600,7 +649,119 @@ def frames_from_video(path: Path, folder: Path, n: int = 3) -> list[Path]:
     return out
 
 
+def compose_post(st: dict, folder: Path, tag: str, shots: list[dict], videos: list[Path],
+                 note: str, fmt: str, problems: list[str], sources: list[str]) -> str | None:
+    """Собирает и показывает ОДИН пост из набора кадров одного объекта."""
+    owner = settings.owner_id
+    photos = [sh["path"] for sh in shots]
+    befores = {sh["pair"]: i for i, sh in enumerate(shots)
+               if sh.get("pair") and sh.get("role") == "before"}
+    pairs_idx = [(befores[sh["pair"]], i) for i, sh in enumerate(shots)
+                 if sh.get("pair") in befores and sh.get("role") == "after"]
+    rooms = list(dict.fromkeys(sh["room"] for sh in shots if sh.get("room")))
+    stages = list(dict.fromkeys(sh["stage"] for sh in shots if sh.get("stage")))
+    guess = ", ".join(rooms[:3]) or "материал с объекта"
+    if pairs_idx:
+        guess = f"до/после: {guess}"
+    elif stages:
+        guess = f"{guess} ({', '.join(stages[:2])})"
+
+    eyes = photos[:8] or (frames_from_video(videos[0], folder) if videos else [])
+    try:
+        data = brand.caption_for_object(
+            guess=guess, note=note, photos=len(photos), videos=len(videos),
+            has_before_after=bool(pairs_idx), images=eyes,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.exception("ИИ не ответил")
+        data = {"text": note or "Новый объект в работе.",
+                "hashtags": ["#ремонтподключ", "#евроремонт", "#строительнаякомпания"],
+                "video_title": "Объект в работе", "video_subtitle": ""}
+        problems = problems + [f"текст писал не ИИ, а заглушка: {e}"]
+
+    caption = build_caption(data.get("text", ""), data.get("hashtags"))
+
+    # ---- карточки до/после ----
+    pairs, ba_cards, used = [], [], set()
+    for k, (bi, ai) in enumerate(pairs_idx):
+        b_, a_ = photos[bi], photos[ai]
+        used.update((bi, ai))
+        pairs.append((ph.label(b_, folder / f"{tag}_ba{k}_do.jpg", "до"),
+                      ph.label(a_, folder / f"{tag}_ba{k}_posle.jpg", "после")))
+        style = cards.BA_STYLES[(k + len(st.get("posts", {}))) % len(cards.BA_STYLES)]
+        try:
+            ba_cards.append(cards.before_after(
+                folder / f"{tag}_ba{k}_card.jpg", b_, a_,
+                title=(data.get("video_title") or "") if k == 0 else "",
+                style=style, theme=pick_theme(st)))
+        except Exception as e:  # noqa: BLE001
+            log.warning("карточка до/после не собралась: %s", e)
+    rest = [p_ for i, p_ in enumerate(photos) if i not in used]
+
+    # ---- ролик ----
+    want_video = fmt == "reel" or (fmt == "auto" and (videos or len(photos) >= 3))
+    if fmt == "photos" and videos:
+        problems = problems + ["видео не монтировал — ты просил только фото"]
+    video_path = None
+    if want_video:
+        try:
+            title = ph.title_card(folder / f"{tag}_title.jpg",
+                                  data.get("video_title") or "Объект в работе",
+                                  data.get("video_subtitle") or "",
+                                  photos[0] if photos else None)
+            outro = ph.outro_card(folder / f"{tag}_outro.jpg")
+            report = vid.build_reel(
+                videos=videos, photos=rest, before_after=pairs,
+                title_card=title, outro_card=outro,
+                out_path=folder / f"{tag}_reel.mp4", workdir=folder / f"tmp{tag}",
+            )
+            video_path = folder / f"{tag}_reel.mp4"
+            log.info("монтаж: %s", report)
+            problems = problems + report.get("skipped", [])
+        except Exception as e:  # noqa: BLE001
+            log.exception("монтаж упал")
+            problems = problems + [f"видео не собралось: {e}"]
+
+    note_line = ("\n\n⚠️ " + "\n⚠️ ".join(problems[:3])) if problems else ""
+    pid = st_mod.new_post(
+        st, text=caption, topic=(guess or note)[:120], source="object",
+        sources=sources, note=note, theme=pick_theme(st) if ba_cards else None,
+    )
+
+    if video_path and video_path.exists():
+        msg = tg.send_video(owner, video_path, f"{caption}\n\n———\nПроверь и решай:{note_line}",
+                            kb_review(pid, True))
+        st["posts"][pid]["video_file_id"] = tg.file_id_of(msg)
+        st["posts"][pid]["review_msg_id"] = msg["message_id"]
+    else:
+        plain = rest if ba_cards else photos
+        ready = ba_cards + [ph.to_post(p_, folder / f"{tag}_post{i:02d}.jpg")
+                            for i, p_ in enumerate(plain[: 10 - len(ba_cards)])]
+        if not ready:
+            tg.send_message(owner, "Фотографий не оказалось, а видео ты просил не трогать.")
+            return None
+        if len(ready) > 1:
+            # грузим по одной, чтобы забрать file_id каждой — по ним потом
+            # публикуем в канал без повторной загрузки
+            sent = [tg.send_photo(owner, p_) for p_ in ready]
+            ids = [fid for m in sent if (fid := tg.file_id_of(m))]
+            msg = tg.send_message(owner, f"{caption}\n\n———\nПроверь и решай:{note_line}",
+                                  kb_review(pid, False))
+        else:
+            msg = tg.send_photo(owner, ready[0], f"{caption}\n\n———\nПроверь и решай:{note_line}",
+                                kb_review(pid, False))
+            ids = [fid for fid in [tg.file_id_of(msg)] if fid]
+        st["posts"][pid]["photo_file_ids"] = [i for i in ids if i]
+        st["posts"][pid]["review_msg_id"] = msg["message_id"]
+
+    remember(st, "система", f"показал пост #{pid} по материалу с объекта: {guess[:80]}")
+    log.info("пост #%s собран (%d кадр(ов), пар до/после: %d)", pid, len(photos), len(pairs_idx))
+    return pid
+
+
 def build_post(st: dict) -> None:
+    """Разбирает пачку: чистит кадры, режет коллажи и делает столько постов,
+    сколько объектов прислали."""
     batch = st.get("batch") or {}
     media = batch.get("media") or []
     if not media:
@@ -622,133 +783,27 @@ def build_post(st: dict) -> None:
         st["batch"] = None
         return
 
-    guess, ba = guess_kind(media, note)
     fmt = batch.get("format") or "auto"
-    if batch.get("keep_order"):
-        ba = False          # он просил не трогать порядок кадров
+    sources = [m["file_id"] for m in media]
 
-    # ---- осмотр кадров: лишнее убрать, пары до/после найти ----
-    pairs_idx: list[dict] = []
-    if photos:
-        photos, pairs_idx, seen_rooms = tidy_photos(photos, folder, note, problems)
-        if pairs_idx:
-            ba = True
-            guess = "до/после"
-        elif seen_rooms:
-            guess = f"{guess}: {', '.join(seen_rooms[:4])}"
+    shots = prepare_shots(photos, folder, note, problems) if photos else []
+    groups = group_shots(shots) if not batch.get("keep_order") else [shots]
+    if len(groups) > 1:
+        log.info("в пачке %d разных объекта — делаю столько же постов", len(groups))
+        tg.send_message(owner, f"Вижу {len(groups)} разных объекта — соберу отдельный "
+                               f"пост на каждый.")
 
-    # ---- текст ----
-    # Модель смотрит на кадры: без этого она пишет «показываем рабочие моменты»
-    # про готовый интерьер. Если фото нет — вынимаем несколько кадров из видео.
-    if photos:
-        eyes = list(photos[:8])
-    elif videos:
-        eyes = frames_from_video(videos[0], folder)
-    else:
-        eyes = []
-    try:
-        data = brand.caption_for_object(
-            guess=guess, note=note, photos=len(photos), videos=len(videos),
-            has_before_after=ba, images=eyes,
-        )
-    except Exception as e:  # noqa: BLE001
-        log.exception("ИИ не ответил")
-        data = {"text": note or "Новый объект в работе.",
-                "hashtags": ["#ремонтподключ", "#евроремонт", "#строительнаякомпания"],
-                "video_title": "Объект в работе", "video_subtitle": ""}
-        problems.append(f"текст писал не ИИ, а заглушка: {e}")
-
-    caption = build_caption(data.get("text", ""), data.get("hashtags"))
-
-    # ---- картинка или ролик ----
-    pairs = []
-    rest = photos
-    ba_cards: list[Path] = []
-    if pairs_idx:
-        used = set()
-        for k, pr in enumerate(pairs_idx):
-            b_, a_ = photos[pr["before"]], photos[pr["after"]]
-            used.update((pr["before"], pr["after"]))
-            pairs.append((ph.label(b_, folder / f"ba{k}_do.jpg", "до"),
-                          ph.label(a_, folder / f"ba{k}_posle.jpg", "после")))
-            style = cards.BA_STYLES[(k + len(st.get("posts", {}))) % len(cards.BA_STYLES)]
-            try:
-                ba_cards.append(cards.before_after(
-                    folder / f"ba{k}_card.jpg", b_, a_,
-                    title=(data.get("video_title") or "") if k == 0 else "",
-                    style=style, theme=pick_theme(st)))
-            except Exception as e:  # noqa: BLE001
-                log.warning("карточка до/после не собралась: %s", e)
-        rest = [p_ for i, p_ in enumerate(photos) if i not in used]
-    elif ba and len(photos) >= 2:
-        pairs = [(ph.label(photos[0], folder / "ba_do.jpg", "до"),
-                  ph.label(photos[-1], folder / "ba_posle.jpg", "после"))]
-        try:
-            ba_cards.append(cards.before_after(folder / "ba_card.jpg", photos[0], photos[-1],
-                                               title=data.get("video_title") or "",
-                                               style="side", theme=pick_theme(st)))
-        except Exception as e:  # noqa: BLE001
-            log.warning("карточка до/после не собралась: %s", e)
-        rest = photos[1:-1]
-
-    want_video = fmt == "reel" or (fmt == "auto" and (videos or len(photos) >= 3))
-    if fmt == "photos" and videos:
-        problems.append("видео не монтировал — ты просил только фото")
-    video_path = None
-    if want_video:
-        try:
-            title = ph.title_card(folder / "title.jpg", data.get("video_title") or "Объект в работе",
-                                  data.get("video_subtitle") or "", photos[0] if photos else None)
-            outro = ph.outro_card(folder / "outro.jpg")
-            report = vid.build_reel(
-                videos=videos, photos=rest, before_after=pairs,
-                title_card=title, outro_card=outro,
-                out_path=folder / "reel.mp4", workdir=folder / "tmp",
-            )
-            video_path = folder / "reel.mp4"
-            log.info("монтаж: %s", report)
-            problems += report.get("skipped", [])
-        except Exception as e:  # noqa: BLE001
-            log.exception("монтаж упал")
-            problems.append(f"видео не собралось: {e}")
-
-    note_line = ("\n\n⚠️ " + "\n⚠️ ".join(problems[:3])) if problems else ""
-    pid = st_mod.new_post(
-        st, text=caption, topic=(note or guess)[:120], source="object",
-        sources=[m["file_id"] for m in media], note=note,
-        theme=pick_theme(st) if ba_cards else None,
-    )
-
-    if video_path and video_path.exists():
-        msg = tg.send_video(owner, video_path, f"{caption}\n\n———\nПроверь и решай:{note_line}",
-                            kb_review(pid, True))
-        st["posts"][pid]["video_file_id"] = tg.file_id_of(msg)
-        st["posts"][pid]["review_msg_id"] = msg["message_id"]
-    else:
-        plain = rest if ba_cards else photos
-        ready = ba_cards + [ph.to_post(p, folder / f"post{i:02d}.jpg")
-                            for i, p in enumerate(plain[: 10 - len(ba_cards)])]
-        if not ready:
-            tg.send_message(owner, "Фотографий в пачке не оказалось, а видео ты просил не трогать.")
-            st["batch"] = None
-            return
-        if len(ready) > 1:
-            # грузим по одной, чтобы забрать file_id каждой — по ним потом
-            # публикуем в канал без повторной загрузки
-            sent = [tg.send_photo(owner, p) for p in ready]
-            ids = [fid for m in sent if (fid := tg.file_id_of(m))]
-            msg = tg.send_message(owner, f"{caption}\n\n———\nПроверь и решай:{note_line}",
-                                  kb_review(pid, False))
-        else:
-            msg = tg.send_photo(owner, ready[0], f"{caption}\n\n———\nПроверь и решай:{note_line}",
-                                kb_review(pid, False))
-            ids = [fid for fid in [tg.file_id_of(msg)] if fid]
-        st["posts"][pid]["photo_file_ids"] = [i for i in ids if i]
-        st["posts"][pid]["review_msg_id"] = msg["message_id"]
-    remember(st, "система", f"показал пост #{pid} по материалу с объекта: {(note or guess)[:80]}")
+    made = []
+    for n, group in enumerate(groups or [[]]):
+        # видео кладём в первый пост, чтобы не дублировать ролик в каждом
+        pid = compose_post(st, folder, f"g{n}", group, videos if n == 0 else [],
+                           note, fmt, list(problems), sources)
+        if pid:
+            made.append(pid)
 
     st["batch"] = None
-    log.info("пост #%s собран", pid)
+    if not made:
+        tg.send_message(owner, "Собрать пост не вышло — пришли материал ещё раз.")
 
 
 def rebuild(st: dict, pid: str) -> None:
@@ -914,24 +969,31 @@ def regenerate_post(st: dict, pid: str, feedback: str) -> None:
         remember(st, "система", f"показал переделанный пост #{pid}, макет {p['card']}")
         return
 
-    # пост с объекта: заново смотрим на кадры и пишем текст с учётом замечаний
+    # пост с объекта: качаем исходники заново, чистим, режем коллажи, пересобираем
     folder.mkdir(parents=True, exist_ok=True)
     photos = []
-    for i, fid in enumerate(p.get("sources", [])[:8]):
+    for i, fid in enumerate(p.get("sources", [])[:10]):
         dest = folder / f"{i:03d}.jpg"
         try:
             tg.download(fid, dest)
             photos.append(dest)
         except Exception as e:  # noqa: BLE001
             log.warning("исходник не скачался: %s", e)
-    data = brand.caption_for_object(
-        guess=p.get("topic") or "объект", note=p.get("note") or "",
-        photos=len(photos), videos=1 if p.get("video_file_id") else 0,
-        has_before_after=False, images=photos,
-        feedback=feedback, previous=p.get("text", ""),
-    )
-    p["text"] = build_caption(data.get("text", ""), data.get("hashtags"))
-    resend_preview(st, pid, "Переделал текст:")
+    if not photos:
+        tg.send_message(owner, "Исходники недоступны — пришли материал заново.")
+        return
+
+    problems: list[str] = []
+    shots = prepare_shots(photos, folder, p.get("note") or "", problems)
+    p["status"] = "rejected"          # старый пост уступает место пересобранному
+    for n, group in enumerate(group_shots(shots)):
+        compose_post(st, folder, f"re{pid}_{n}", group, [], p.get("note") or "",
+                     "photos", list(problems), p.get("sources", []))
+
+
+def split_post(st: dict, pid: str) -> None:
+    """Разобрать готовый пост на несколько — по объектам на кадрах."""
+    regenerate_post(st, pid, "разбей по объектам: на каждый объект отдельный пост")
 
 
 def make_auto_post(st: dict, force: bool = False, topic: str | None = None) -> str | None:
